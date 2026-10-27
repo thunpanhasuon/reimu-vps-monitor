@@ -21,6 +21,7 @@ import secrets
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -66,21 +67,73 @@ def read_env(path):
     return values
 
 
+class TelegramConnectionError(RuntimeError):
+    """A transport failure that pairing can safely retry."""
+
+
+def connection_error(reason):
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return RuntimeError("Telegram TLS certificate verification failed; check server time and CA certificates.")
+    if isinstance(reason, socket.gaierror):
+        detail = "DNS lookup failed for api.telegram.org"
+    elif isinstance(reason, (TimeoutError, socket.timeout)):
+        detail = "request timed out"
+    elif isinstance(reason, ssl.SSLError):
+        detail = "TLS connection failed"
+    elif isinstance(reason, ConnectionResetError):
+        detail = "connection was reset"
+    else:
+        # Do not print arbitrary exception text: it can contain the token URL.
+        detail = "network connection failed (%s)" % type(reason).__name__
+    return TelegramConnectionError("Telegram: " + detail)
+
+
 def api(token, method, **params):
     """Never expose a token-bearing URL through an exception or log."""
     data = urllib.parse.urlencode(params).encode()
     url = "https://api.telegram.org/bot" + token + "/" + method
     try:
-        with urllib.request.urlopen(url, data=data, timeout=25) as response:
+        with urllib.request.urlopen(url, data=data, timeout=max(30, int(params.get("timeout", 0)) + 15)) as response:
             result = json.load(response)
     except urllib.error.HTTPError as exc:
-        raise RuntimeError("Telegram HTTP %s; check token, permissions, rate limits or webhook conflicts."
-                           % exc.code) from None
-    except Exception:
-        raise RuntimeError("Cannot reach Telegram; check DNS and internet access.") from None
+        details = {401: "invalid or revoked bot token", 403: "bot blocked or chat access denied",
+                   409: "another bot poller or webhook is using this bot",
+                   429: "rate limited; wait before trying again"}
+        error_type = TelegramConnectionError if exc.code >= 500 else RuntimeError
+        raise error_type("Telegram HTTP %s: %s" % (exc.code, details.get(exc.code, "request rejected"))) from None
+    except urllib.error.URLError as exc:
+        raise connection_error(exc.reason) from None
+    except (OSError, TimeoutError) as exc:
+        raise connection_error(exc) from None
+    except (ValueError, UnicodeError):
+        raise TelegramConnectionError("Telegram returned an unreadable response") from None
     if not result.get("ok"):
         raise RuntimeError("Telegram rejected the request.")
     return result["result"]
+
+
+def wait_for_pairing(token, code, seconds=180):
+    deadline, offset = time.monotonic() + seconds, 0
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            # Short polling avoids holding an idle HTTPS request open during setup.
+            updates = api(token, "getUpdates", offset=offset, timeout=0,
+                          allowed_updates=json.dumps(["message"]))
+            last_error = None
+        except TelegramConnectionError as exc:
+            last_error = str(exc)
+            print(last_error + "; retrying in 3 seconds...", flush=True)
+            time.sleep(3)
+            continue
+        for update in updates:
+            offset = update["update_id"] + 1
+            message = update.get("message", {})
+            if message.get("text", "").strip() == code and message.get("chat", {}).get("type") == "private":
+                return message["chat"]["id"]
+        time.sleep(2)
+    detail = " Last error: " + last_error if last_error else ""
+    raise RuntimeError("Pairing timed out. Run setup again and send the new pairing code." + detail)
 
 
 def send(config, text):
@@ -103,22 +156,11 @@ def setup(path):
     code = "pair-" + secrets.token_hex(4)
     print("\nOpen https://t.me/%s and send this exact message:\n\n%s\n" % (bot["username"], code))
     print("Waiting up to 3 minutes for your message...", flush=True)
-    deadline, offset, chat_id = time.monotonic() + 180, 0, None
-    while time.monotonic() < deadline and chat_id is None:
-        for update in api(token, "getUpdates", offset=offset, timeout=10,
-                          allowed_updates=json.dumps(["message"])):
-            offset = update["update_id"] + 1
-            message = update.get("message", {})
-            if message.get("text", "").strip() == code and message.get("chat", {}).get("type") == "private":
-                chat_id = message["chat"]["id"]
-                break
-    if chat_id is None:
-        raise RuntimeError("Pairing timed out. Run setup again and send the new pairing code.")
+    chat_id = wait_for_pairing(token, code)
     existing["TELEGRAM_BOT_TOKEN"] = token
     existing["TELEGRAM_CHAT_ID"] = str(chat_id)
     config = {key: convert(existing.get(env, default))
               for env, (key, convert, default) in ENV_FIELDS.items()}
-    send(config, "✅ Connected. Run the monitor or install its service to start alerts.")
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     # Restrictive permissions from the moment the file is opened.
     descriptor = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -127,6 +169,10 @@ def setup(path):
         for env, (_, _, default) in ENV_FIELDS.items():
             output.write(env + "=" + existing.get(env, default) + "\n")
     print("Saved private configuration:", path)
+    try:
+        send(config, "✅ Connected. Run the monitor or install its service to start alerts.")
+    except RuntimeError as exc:
+        print("Pairing saved, but confirmation could not be sent: " + str(exc))
     print("Next: python3 vps_monitor.py test")
 
 

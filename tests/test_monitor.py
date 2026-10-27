@@ -3,11 +3,38 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 import urllib.error
+import socket
+import ssl
 
 import vps_monitor as monitor
 
 
 class MonitorTests(unittest.TestCase):
+    def test_pairing_recovers_from_network_failure(self):
+        updates = [{'update_id': 7, 'message': {'text': 'pair-test', 'chat': {'type': 'private', 'id': 123}}}]
+        with patch.object(monitor, 'api', side_effect=[monitor.TelegramConnectionError('Telegram: request timed out'), updates]) as api:
+            with patch.object(monitor.time, 'sleep'), patch('builtins.print'):
+                self.assertEqual(monitor.wait_for_pairing('secret', 'pair-test'), 123)
+        self.assertEqual(api.call_count, 2)
+        self.assertEqual(api.call_args.kwargs['timeout'], 0)
+
+    def test_pairing_does_not_retry_bad_credentials(self):
+        with patch.object(monitor, 'api', side_effect=RuntimeError('Telegram HTTP 401')) as api:
+            with self.assertRaisesRegex(RuntimeError, '401'):
+                monitor.wait_for_pairing('secret', 'pair-test')
+        self.assertEqual(api.call_count, 1)
+
+    def test_transport_diagnostics(self):
+        for reason, expected in [(socket.gaierror('secret'), 'DNS'), (TimeoutError('secret'), 'timed out'), (ConnectionResetError('secret'), 'reset')]:
+            with self.subTest(reason=type(reason).__name__):
+                error = monitor.connection_error(reason)
+                self.assertIsInstance(error, monitor.TelegramConnectionError)
+                self.assertIn(expected, str(error))
+                self.assertNotIn('secret', str(error))
+        error = monitor.connection_error(ssl.SSLCertVerificationError('secret'))
+        self.assertNotIsInstance(error, monitor.TelegramConnectionError)
+        self.assertIn('certificate', str(error))
+
     def test_sustained_alert_reminder_and_recovery(self):
         alert = monitor.Alert()
         self.assertIsNone(alert.check(95, 90, 0, 120, 1800))
