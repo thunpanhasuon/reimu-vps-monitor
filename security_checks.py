@@ -93,7 +93,7 @@ def package_updates():
         if not package.is_installed or not package.is_upgradable or package.candidate is None:
             continue
         candidate = package.candidate
-        security = any(origin.origin == "Ubuntu" and "security" in origin.archive.lower()
+        security = any(origin.origin.startswith("Ubuntu") and "security" in origin.archive.lower()
                        for origin in candidate.origins)
         changes.append({"package": package.name, "installed": package.installed.version,
                         "candidate": candidate.version, "security": security})
@@ -384,7 +384,10 @@ class Maintenance:
             if old == value:
                 return
             if messages and not (baseline and key not in self.state):
-                self.send(self.config, "\n".join(messages)[:3500])
+                text = "\n".join(messages)
+                if len(text) > 3500:
+                    text = text[:3300] + "\n… Message shortened; full check data is in the VPS state directory."
+                self.send(self.config, text)
             self.state[key] = value
             atomic_json(self.path, self.state)
 

@@ -95,6 +95,14 @@ udp UNCONN 0 0 127.0.0.53%lo:53 0.0.0.0:*
         with patch.dict('sys.modules', {'apt': S(Cache=lambda: [package])}):
             self.assertTrue(security.package_updates()[0]['security'])
 
+    def test_fix_availability_uses_distribution_version_comparison(self):
+        from types import SimpleNamespace as S
+        package = S(candidate=S(version='2'))
+        findings = [{'packages': [{'name': 'example', 'fixed': ['2'], 'kind': 'apt'}]}]
+        with patch.dict('sys.modules', {'apt': S(Cache=lambda: {'example': package}), 'apt_pkg': S(version_compare=lambda a, b: int(a) - int(b))}):
+            annotated = security.annotate_fixes(findings)
+        self.assertEqual(annotated[0]['packages'][0]['fix_status'], 'Available candidate: 2')
+
     def test_self_update_uses_remote_ref_and_ancestry(self):
         from io import BytesIO
         local, remote = 'a' * 40, 'b' * 40

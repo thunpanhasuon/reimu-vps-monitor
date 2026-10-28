@@ -16,5 +16,8 @@ jobs:
       - name: Install Ubuntu scanner dependencies
         run: sudo apt-get update && sudo apt-get install -y python3-apt openscap-scanner iproute2
       - name: Check actual APT cache, sockets, and Canonical OVAL assessment
-        run: /usr/bin/python3 tests/linux_integration.py
+        run: |
+          sudo install -d /opt/reimu-ci
+          sudo install -m 644 security_checks.py tests/linux_integration.py /opt/reimu-ci/
+          sudo systemd-run --unit=reimu-ci --wait --pipe --collect --property=User=runner --property=ProtectSystem=strict --property=ProtectHome=true --property=PrivateTmp=true --property=NoNewPrivileges=true --property=CapabilityBoundingSet= /usr/bin/python3 /opt/reimu-ci/linux_integration.py
         timeout-minutes: 20

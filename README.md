@@ -82,10 +82,12 @@ on a non-loopback address is **not proof of internet reachability**; Reimu does
 not change or probe firewalls. Process names may be unavailable for processes
 owned by another user. Short-lived listeners between checks may be missed.
 
-CVE alerts show the Canonical severity, CVE ID, installed package evidence,
-and the fixed package version when supplied by the assessment. A fixed
-version in Canonical's data is not a promise it is available in your enabled
-repositories; some fixes require Ubuntu Pro/ESM. Potentially affected packages
+CVE alerts show the Canonical severity, CVE ID, installed package or running
+kernel evidence, and the fixed version when supplied by the assessment.
+For APT packages, candidate availability is checked against your enabled
+repositories using Debian version comparison. Kernel findings link to the
+Ubuntu advisory for package-specific remediation. Some fixes require Ubuntu
+Pro/ESM. Potentially affected packages
 are labeled as such. This covers Ubuntu APT package assessments, not pip/npm
 dependencies, Docker images, custom builds, or every third-party PPA.
 An old vulnerable kernel package can match even when a newer kernel is
@@ -94,7 +96,8 @@ running; assess the listed installed package and reboot status together.
 Alerts show at most eight CVEs per summary, with higher Canonical severities
 first. Full findings are saved privately at
 `/var/lib/reimu-vps/cve-findings.json`. Scan errors and incomplete evaluations
-are explicitly reported. Review advisories before installing fixes.
+are explicitly reported. Feeds more than seven days old are rejected rather
+than treated as current. Review advisories before installing fixes.
 
 Sources: [Canonical OVAL documentation](https://documentation.ubuntu.com/security/security-updates/oval/)
 and [official Ubuntu feeds](https://security-metadata.canonical.com/oval/).
