@@ -422,6 +422,8 @@ class Maintenance:
         findings, incomplete = cve_scan(self.directory)
         fingerprint = hashlib.sha256(json.dumps([findings, incomplete], sort_keys=True).encode()).hexdigest()
         lines = ["🔴 Ubuntu CVE assessment: %s finding(s)" % len(findings)] if findings else ["✅ No matching CVEs found in the current Ubuntu assessment"]
+        if incomplete:
+            lines[0] = "⚠️ Ubuntu CVE assessment incomplete: %s finding(s)" % len(findings)
         lines.append("Scope: Ubuntu APT packages; severity is Canonical's rating. Not an all-software safety guarantee.")
         if incomplete:
             lines.append("⚠️ %s definitions could not be evaluated; scan is incomplete." % incomplete)
