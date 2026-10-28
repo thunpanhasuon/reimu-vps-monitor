@@ -12,6 +12,29 @@ import vps_monitor as monitor
 
 
 class SecurityTests(unittest.TestCase):
+    def test_true_version_check_in_wrong_kernel_branch_is_excluded(self):
+        xml = '''<root>
+<definition id="d1" class="vulnerability"><metadata><reference source="CVE" ref_id="CVE-2099-99999"/></metadata></definition>
+<uname_test id="running"/>
+<variable_test id="wrong-version" comment="kernel version comparison"><state state_ref="fix"/></variable_test>
+<variable_state id="fix"><value operation="less than">0:7.0.0-31</value></variable_state>
+<uname_item id="kernel"><os_release>6.8.0-147-generic</os_release></uname_item>
+<variable_item id="version"><value>0:6.8.0-147</value></variable_item>
+<definition definition_id="d1" result="true"><criteria result="true" operator="OR">
+<criterion test_ref="running" result="true"/>
+<criteria result="false" operator="AND"><criterion test_ref="wrong-flavour" result="false"/><criterion test_ref="wrong-version" result="true"/></criteria>
+</criteria></definition>
+<test test_id="running"><tested_item item_id="kernel" result="true"/></test>
+<test test_id="wrong-version"><tested_item item_id="version" result="true"/></test>
+</root>'''
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'results.xml'
+            path.write_text(xml)
+            findings, incomplete = security.oval_findings(path)
+        self.assertEqual(incomplete, 0)
+        self.assertEqual(findings[0]['packages'][0]['installed'], '6.8.0-147-generic')
+        self.assertEqual(findings[0]['packages'][0]['fixed'], [])
+
     def test_running_kernel_evidence_and_fixed_version(self):
         xml = '''<root>
 <definition id="d1" class="vulnerability"><metadata><reference source="CVE" ref_id="CVE-2099-99999"/></metadata></definition>
@@ -21,7 +44,7 @@ class SecurityTests(unittest.TestCase):
 <variable_state id="s2"><value operation="less than">0:6.8.0-99</value></variable_state>
 <uname_item id="i1"><os_release>6.8.0-50-generic</os_release></uname_item>
 <variable_item id="i2"><value>0:6.8.0-50</value></variable_item>
-<definition definition_id="d1" result="true"><criteria><criterion test_ref="t1" result="true"/><criterion test_ref="t2" result="true"/></criteria></definition>
+<definition definition_id="d1" result="true"><criteria result="true"><criterion test_ref="t1" result="true"/><criterion test_ref="t2" result="true"/></criteria></definition>
 <test test_id="t1"><tested_item item_id="i1" result="true"/></test>
 <test test_id="t2"><tested_item item_id="i2" result="true"/></test>
 </root>'''
@@ -131,7 +154,7 @@ udp UNCONN 0 0 127.0.0.53%lo:53 0.0.0.0:*
 <dpkginfo_test id="t1"><state state_ref="s1"/></dpkginfo_test>
 <dpkginfo_state id="s1"><evr operation="less than">2</evr></dpkginfo_state>
 <dpkginfo_item id="i1"><name>example</name><evr>1</evr></dpkginfo_item>
-<definition definition_id="d1" result="true"><criteria><criterion test_ref="t1" result="true" comment="package is affected"/></criteria></definition>
+<definition definition_id="d1" result="true"><criteria result="true"><criterion test_ref="t1" result="true" comment="package is affected"/></criteria></definition>
 <definition definition_id="d2" result="unknown"/>
 <test test_id="t1"><tested_item item_id="i1" result="true"/></test>
 </root>'''

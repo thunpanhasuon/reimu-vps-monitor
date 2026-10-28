@@ -175,6 +175,19 @@ def child_text(element, name, default=""):
     return default
 
 
+def contributing_criteria(element):
+    """A true leaf inside a false kernel-flavour branch is not evidence."""
+    name = local_name(element)
+    if name in ("definition", "criteria", "criterion") and element.get("result") != "true":
+        return
+    if name == "criterion":
+        yield element
+        return
+    for child in element:
+        if local_name(child) in ("criteria", "criterion"):
+            yield from contributing_criteria(child)
+
+
 def oval_findings(results_path):
     """Read evaluated OVAL results, not guessed upstream version comparisons."""
     root = ET.parse(results_path).getroot()
@@ -213,9 +226,7 @@ def oval_findings(results_path):
         severity = next((node.text for node in definition.iter() if local_name(node) == "severity"), "Unknown")
         packages = []
         comments = {node.get("test_ref"): node.get("comment", "") for node in definition.iter() if node.get("test_ref")}
-        for criterion in evaluated_definition.iter():
-            if local_name(criterion) != "criterion" or criterion.get("result") != "true":
-                continue
+        for criterion in contributing_criteria(evaluated_definition):
             test_id = criterion.get("test_ref")
             test, tested = tests.get(test_id), result_tests.get(test_id)
             if test is None or tested is None:
