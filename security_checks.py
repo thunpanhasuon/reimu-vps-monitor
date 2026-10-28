@@ -188,11 +188,11 @@ def oval_findings(results_path):
             definitions[element.get("id")] = element
         elif name == "definition" and element.get("definition_id"):
             evaluated.append(element)
-        elif name == "dpkginfo_test":
+        elif name in ("dpkginfo_test", "uname_test", "variable_test"):
             tests[element.get("id")] = element
-        elif name == "dpkginfo_state":
+        elif name in ("dpkginfo_state", "uname_state", "variable_state"):
             states[element.get("id")] = element
-        elif name == "dpkginfo_item":
+        elif name in ("dpkginfo_item", "uname_item", "variable_item"):
             items[element.get("id")] = element
         elif name == "test" and element.get("test_id"):
             result_tests[element.get("test_id")] = element
@@ -212,6 +212,7 @@ def oval_findings(results_path):
                        if local_name(ref) == "reference" and ref.get("source") == "CVE"})
         severity = next((node.text for node in definition.iter() if local_name(node) == "severity"), "Unknown")
         packages = []
+        comments = {node.get("test_ref"): node.get("comment", "") for node in definition.iter() if node.get("test_ref")}
         for criterion in evaluated_definition.iter():
             if local_name(criterion) != "criterion" or criterion.get("result") != "true":
                 continue
@@ -223,16 +224,30 @@ def oval_findings(results_path):
             for state_ref in test:
                 state = states.get(state_ref.get("state_ref"))
                 if state is not None:
-                    fixed.extend(node.text for node in state if local_name(node) == "evr" and node.get("operation") == "less than")
+                    fixed.extend(node.text for node in state if local_name(node) in ("evr", "value") and node.get("operation") == "less than")
             for tested_item in tested:
-                if local_name(tested_item) != "tested_item" or tested_item.get("result") != "true":
+                existence_only = not any(local_name(node) == "state" for node in test)
+                if local_name(tested_item) != "tested_item" or not (tested_item.get("result") == "true" or (existence_only and tested_item.get("result") == "not evaluated")):
                     continue
                 item = items.get(tested_item.get("item_id"))
                 if item is None:
                     continue
-                packages.append({"name": child_text(item, "name"), "installed": child_text(item, "evr"),
+                variable = local_name(item) == "variable_item"
+                if variable and "kernel" not in test.get("comment", "").lower():
+                    continue
+                kernel = local_name(item) == "uname_item" or variable
+                comment = comments.get(test_id, "") or test.get("comment", "Ubuntu OVAL matched")
+                packages.append({"name": "Linux kernel" if kernel else child_text(item, "name"),
+                                 "installed": child_text(item, "value") if variable else child_text(item, "os_release") if kernel else child_text(item, "evr"),
                                  "fixed": sorted(set(fixed)),
-                                 "assessment": criterion.get("comment", "Ubuntu OVAL matched")})
+                                 "assessment": comment, "kind": "kernel" if kernel else "apt"})
+        kernels = [package for package in packages if package["kind"] == "kernel"]
+        if kernels:
+            combined = kernels[0].copy()
+            combined["fixed"] = sorted({version for package in kernels for version in package["fixed"]})
+            packages = [package for package in packages if package["kind"] != "kernel"] + [combined]
+        if not packages:
+            incomplete += 1
         for cve in cves:
             findings.append({"cve": cve, "severity": severity or "Unknown", "packages": packages})
     return sorted(findings, key=lambda finding: finding["cve"]), incomplete
@@ -253,6 +268,30 @@ def verify_feed_age(path):
         raise RuntimeError("Ubuntu CVE feed has no usable generation timestamp") from None
     if age > 7 * 86400 or age < -86400:
         raise RuntimeError("Ubuntu CVE feed is stale or server time is incorrect; assessment unavailable")
+
+
+def annotate_fixes(findings):
+    try:
+        import apt
+        import apt_pkg
+        cache = apt.Cache()
+    except ImportError:
+        cache = None
+    for finding in findings:
+        for package in finding["packages"]:
+            if not package["fixed"]:
+                package["fix_status"] = "No fixed version specified in the assessment"
+            elif package.get("kind") == "kernel":
+                package["fix_status"] = "Kernel fix listed; review Ubuntu advisory and kernel package updates"
+            elif cache is None:
+                package["fix_status"] = "APT availability could not be checked"
+            elif package["name"] not in cache or cache[package["name"]].candidate is None:
+                package["fix_status"] = "No candidate in enabled APT repositories"
+            else:
+                candidate = cache[package["name"]].candidate.version
+                available = any(apt_pkg.version_compare(candidate, version) >= 0 for version in package["fixed"])
+                package["fix_status"] = ("Available candidate: " + candidate) if available else "Fix not offered by enabled APT repositories"
+    return findings
 
 
 def cve_scan(directory, keep_results=False):
@@ -292,7 +331,8 @@ def cve_scan(directory, keep_results=False):
             raise RuntimeError("OpenSCAP scan failed (exit %s); see last-oscap-error.log in the state directory" % result.returncode)
         if keep_results:
             shutil.copyfile(results, Path(directory) / "last-oval-results.xml")
-        return oval_findings(results)
+        findings, incomplete = oval_findings(results)
+        return annotate_fixes(findings), incomplete
 
 
 def reimu_update():
@@ -389,6 +429,7 @@ class Maintenance:
             for package in finding["packages"][:3]:
                 fix = ", ".join(package["fixed"]) or "not specified by this assessment"
                 lines.append("%s %s; fixed version: %s" % (package["name"], package["installed"], fix))
+                lines.append(package.get("fix_status", "APT availability not checked"))
                 if "might" in package["assessment"]:
                     lines.append("Ubuntu marks this as potentially affected; review advisory.")
             lines.append("https://ubuntu.com/security/" + finding["cve"])

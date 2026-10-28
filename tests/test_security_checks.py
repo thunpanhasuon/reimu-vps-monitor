@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import security_checks as security
@@ -11,6 +12,45 @@ import vps_monitor as monitor
 
 
 class SecurityTests(unittest.TestCase):
+    def test_running_kernel_evidence_and_fixed_version(self):
+        xml = '''<root>
+<definition id="d1" class="vulnerability"><metadata><reference source="CVE" ref_id="CVE-2099-99999"/></metadata></definition>
+<uname_test id="t1"><state state_ref="s1"/></uname_test>
+<uname_state id="s1"><os_release operation="pattern match">kernel</os_release></uname_state>
+<variable_test id="t2" comment="kernel version comparison"><state state_ref="s2"/></variable_test>
+<variable_state id="s2"><value operation="less than">0:6.8.0-99</value></variable_state>
+<uname_item id="i1"><os_release>6.8.0-50-generic</os_release></uname_item>
+<variable_item id="i2"><value>0:6.8.0-50</value></variable_item>
+<definition definition_id="d1" result="true"><criteria><criterion test_ref="t1" result="true"/><criterion test_ref="t2" result="true"/></criteria></definition>
+<test test_id="t1"><tested_item item_id="i1" result="true"/></test>
+<test test_id="t2"><tested_item item_id="i2" result="true"/></test>
+</root>'''
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'results.xml'
+            path.write_text(xml)
+            findings, incomplete = security.oval_findings(path)
+        self.assertEqual(incomplete, 0)
+        self.assertEqual(findings[0]['packages'][0]['name'], 'Linux kernel')
+        self.assertEqual(findings[0]['packages'][0]['fixed'], ['0:6.8.0-99'])
+        self.assertEqual(len(findings[0]['packages']), 1)
+
+    def test_stale_feed_is_not_reported_clean(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'feed.xml'
+            path.write_text('<root><generator><timestamp>2000-01-01T00:00:00Z</timestamp></generator></root>')
+            with self.assertRaisesRegex(RuntimeError, 'stale'):
+                security.verify_feed_age(path)
+            stamp = datetime.now(timezone.utc).isoformat()
+            path.write_text('<root><generator><timestamp>' + stamp + '</timestamp></generator></root>')
+            security.verify_feed_age(path)
+
+    def test_missing_evaluation_is_not_reported_clean(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'results.xml'
+            path.write_text('<root/>')
+            with self.assertRaisesRegex(RuntimeError, 'unavailable'):
+                security.oval_findings(path)
+
     def test_ipv4_ipv6_and_udp_listeners(self):
         parsed = security.parse_listeners('''tcp LISTEN 0 128 127.0.0.1:8080 0.0.0.0:* users:(("python3",pid=42,fd=3))
 tcp LISTEN 0 128 [::]:22 [::]:*
