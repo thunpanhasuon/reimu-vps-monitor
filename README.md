@@ -122,6 +122,74 @@ To disable the metadata timer:
 sudo systemctl disable --now reimu-apt-refresh.timer
 ```
 
+## Optional automatic Ubuntu security updates
+
+To enable the security-only updater (opt-in; ordinary installs do not enable it):
+
+```bash
+git pull --ff-only
+sudo apt-get install -y unattended-upgrades
+sudo /usr/bin/python3 vps_monitor.py install --config /etc/reimu-vps.env --enable-security-updates
+sudo systemctl list-timers reimu-security-updates.timer --no-pager
+```
+
+The separate root-owned service uses Ubuntu's `unattended-upgrade` tool.
+It runs daily between **03:00 and 03:30 Asia/Phnom_Penh**. A missed run can
+execute when the persistent timer is next enabled. To start a check/update now:
+
+```bash
+sudo systemctl start --no-block reimu-security-updates.service
+```
+
+Reimu reports actual package-version changes, partial/complete failures,
+packages still pending, and required reboots. Quiet runs with no changes do
+not send daily success messages. Reports are checked every minute. Manual
+reboots remain your responsibility; updated kernels take effect after reboot.
+Security package installation can restart services and briefly interrupt apps.
+
+The policy allows Ubuntu security pockets and existing Ubuntu Pro/ESM security
+pockets only. It does not enroll you in Pro or enable a subscription. Regular
+feature updates, distro upgrades, Reimu updates, containers, pip/npm packages,
+and third-party software remain manual. Missing dependencies, held packages,
+or unavailable security fixes may still need attention. The updater refuses
+to run if later APT settings broaden its allowed origins or enable automatic
+reboots. It does not automatically remove kernels or unused dependencies.
+
+Enabling this feature writes `/etc/apt/apt.conf.d/99zz-reimu-security-updates`
+and replaces the native `apt-daily-upgrade.timer` schedule with
+`reimu-security-updates.timer` to avoid duplicate scheduling. It leaves any
+already-running package update alone. The regular APT download/refresh timer
+is unaffected. This policy also applies to manual `unattended-upgrade` calls;
+ordinary manual `apt upgrade` continues to use your enabled repositories.
+
+The Telegram monitor stays unprivileged and cannot invoke root commands.
+Root-owned results are saved in `/var/lib/reimu-security-updates/status.json`;
+the detailed log is root-readable only. Check the service with:
+
+```bash
+sudo journalctl -u reimu-security-updates -n 50 --no-pager
+sudo cat /var/lib/reimu-security-updates/status.json
+```
+
+To simulate the updater without installing anything:
+
+```bash
+sudo /usr/bin/python3 /opt/reimu-vps/security_updater.py --dry-run
+```
+
+Dry-run results are stored separately in `dry-run.json`. To stop future
+automatic installations without interrupting a running update:
+
+```bash
+sudo systemctl disable --now reimu-security-updates.timer
+```
+
+The native upgrade timer remains disabled until you deliberately re-enable it.
+If you keep this feature disabled, update security packages manually. Reimu
+will warn if a configured updater has no recent run result.
+
+Reference: [Ubuntu automatic update documentation](https://ubuntu.com/server/docs/how-to/software/automatic-updates/).
+
 ## Alerts
 
 Defaults: CPU 90%, RAM 90%, disk 85%, incoming or outgoing traffic 100 Mbps.

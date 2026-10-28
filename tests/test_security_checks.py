@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
@@ -12,6 +13,23 @@ import vps_monitor as monitor
 
 
 class SecurityTests(unittest.TestCase):
+    def test_auto_update_reports_changes_once_and_quiet_empty_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sent = []
+            checker = security.Maintenance({'state_directory': str(root / 'monitor')}, lambda config, text: sent.append(text))
+            (root / 'configuration.json').write_text(json.dumps({'schedule': 'Daily 03:00 Cambodia', 'enabled_at': time.time()}))
+            report = {'run_id': '1', 'status': 'completed', 'finished_at': time.time(), 'changes': [{'package': 'example', 'before': '1', 'after': '2'}]}
+            (root / 'status.json').write_text(json.dumps(report))
+            checker.automatic_updates(root)
+            checker.automatic_updates(root)
+            self.assertEqual(sum('example: 1 → 2' in text for text in sent), 1)
+            sent.clear()
+            report.update(run_id='2', changes=[])
+            (root / 'status.json').write_text(json.dumps(report))
+            checker.automatic_updates(root)
+            self.assertEqual(sent, [])
+
     def test_true_version_check_in_wrong_kernel_branch_is_excluded(self):
         xml = '''<root>
 <definition id="d1" class="vulnerability"><metadata><reference source="CVE" ref_id="CVE-2099-99999"/></metadata></definition>

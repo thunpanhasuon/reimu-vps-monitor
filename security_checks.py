@@ -416,6 +416,51 @@ class Maintenance:
         packages = reboot_required()
         self.notify("reboot", packages, ["🔔 Reboot required: " + ", ".join(packages)] if packages else ["✅ Reboot-required flag cleared"], baseline=not packages)
 
+    def automatic_updates(self, directory=Path('/var/lib/reimu-security-updates')):
+        configuration = directory / 'configuration.json'
+        if not configuration.exists():
+            return
+        configured = json.loads(configuration.read_text())
+        self.notify('automatic_update_configuration', {key: value for key, value in configured.items() if key != 'enabled_at'},
+                    ['🛡️ Automatic Ubuntu security updates enabled.',
+                     'Schedule: ' + configured['schedule'], 'Reboots remain manual.'])
+        path = directory / 'status.json'
+        if not path.exists():
+            if time.time() - configured.get('enabled_at', time.time()) > 30 * 3600:
+                self.notify('automatic_update_missing', True, ['⚠️ No automatic security-update run recorded after 30 hours. Check reimu-security-updates.timer and its service.'])
+            return
+        report = json.loads(path.read_text())
+        if report['status'] == 'running':
+            if time.time() - report['started_at'] > 7200:
+                self.notify('automatic_update_slow', report['run_id'],
+                            ['⚠️ Security update has been running for over 2 hours or was interrupted. Inspect reimu-security-updates.service; do not kill dpkg blindly.'])
+            return
+        stale = time.time() - report.get('finished_at', time.time()) > 30 * 3600
+        self.notify('automatic_update_missing', stale,
+                    ['⚠️ Last automatic security-update result is older than 30 hours. Check reimu-security-updates.timer.'] if stale else [], baseline=not stale)
+        with self.lock:
+            previous = self.state.get('automatic_update_result', {})
+        packages = report.get('changes', [])
+        failed = report['status'] == 'failed'
+        lines = []
+        if failed or packages or previous.get('status') == 'failed' or report.get('inventory_warning'):
+            lines = ['❌ Automatic security update failed' if failed else '✅ Automatic security update completed']
+            if failed:
+                lines += ['Stage: ' + report['stage'], 'Reason: ' + report.get('error', 'Unknown error'),
+                          'Details: sudo journalctl -u reimu-security-updates; root-only last-run.log is in /var/lib/reimu-security-updates.']
+            lines += ['%s: %s → %s' % (item['package'], item['before'], item['after']) for item in packages[:12]]
+            if len(packages) > 12:
+                lines.append('%s packages changed; full report is saved on the VPS.' % len(packages))
+            if report.get('inventory_warning'):
+                lines.append('⚠️ ' + report['inventory_warning'])
+            if report.get('reboot_required'):
+                lines.append('🔔 Reboot required; restart manually when ready.')
+        pending = report.get('pending_security', [])
+        self.notify('automatic_update_pending', pending,
+                    ['⚠️ Security updates remain pending after the automatic run: ' + ', '.join(pending[:12]),
+                     'Some packages may be held back or need manual attention.'] if pending else [], baseline=not pending)
+        self.notify('automatic_update_result', {'run_id': report['run_id'], 'status': report['status']}, lines)
+
     def ports(self):
         current = listening_ports()
         with self.lock:
@@ -474,7 +519,7 @@ class Maintenance:
                 LOG.warning("Could not deliver maintenance failure notification")
 
     def run(self):
-        tasks = {"reboot": (60, self.reboot)}
+        tasks = {"reboot": (60, self.reboot), "automatic updates": (60, self.automatic_updates)}
         if self.config["port_alerts"]:
             tasks["ports"] = (self.config["port_interval"], self.ports)
         if self.config["update_alerts"]:

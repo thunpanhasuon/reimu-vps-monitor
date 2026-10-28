@@ -337,10 +337,12 @@ def monitor(config):
     LOG.info("Monitor stopped")
 
 
-def install(path, root=Path("/")):
+def install(path, root=Path("/"), enable_security_updates=False):
     if os.geteuid() != 0:
         raise RuntimeError("Installation needs sudo. Setup and testing do not.")
     config = load(path)
+    if enable_security_updates and not Path('/usr/bin/unattended-upgrade').exists():
+        raise RuntimeError('Install unattended-upgrades first: sudo apt-get install unattended-upgrades')
     # Read before opening the destination: updates may use the installed .env itself.
     private_config = path.read_bytes()
     if config["state_directory"] not in ("", "/var/lib/reimu-vps"):
@@ -360,6 +362,8 @@ def install(path, root=Path("/")):
     os.chmod(dest / "vps_monitor.py", 0o644)
     shutil.copyfile(Path(__file__).resolve().parent / "security_checks.py", dest / "security_checks.py")
     os.chmod(dest / "security_checks.py", 0o644)
+    shutil.copyfile(source / "security_updater.py", dest / "security_updater.py")
+    os.chmod(dest / "security_updater.py", 0o644)
     (dest / "build.json").write_text(json.dumps({"commit": commit}))
     target = root / "etc/reimu-vps.env"
     descriptor, temporary = security_checks.tempfile.mkstemp(dir=target.parent, prefix=".reimu-env-")
@@ -428,27 +432,37 @@ WantedBy=timers.target
     subprocess.run(["systemctl", "daemon-reload"], check=True)
     subprocess.run(["systemctl", "enable", "--now", "reimu-apt-refresh.timer"], check=True)
     subprocess.run(["systemctl", "start", "--no-block", "reimu-apt-refresh.service"], check=True)
-    subprocess.run(["systemctl", "enable", "--now", "reimu-vps.service"], check=True)
+    if enable_security_updates:
+        import security_updater
+        security_updater.configure(root)
+    subprocess.run(["systemctl", "enable", "reimu-vps.service"], check=True)
     subprocess.run(["systemctl", "restart", "reimu-vps.service"], check=True)
     print("Installed. Runs after SSH disconnects and starts at boot.")
     print("Status: sudo systemctl status reimu-vps --no-pager")
     print("Logs:   sudo journalctl -u reimu-vps -n 30 --no-pager")
     print("Edit thresholds: sudo nano /etc/reimu-vps.env")
     print("Then restart: sudo systemctl restart reimu-vps")
+    if enable_security_updates:
+        print("Automatic Ubuntu security updates enabled: daily 03:00–03:30 Cambodia time.")
+        print("Reboots remain manual. Regular feature updates and Reimu updates remain manual.")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command", choices=["setup", "test", "run", "install", "check"])
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--enable-security-updates", action="store_true",
+                        help="With install: enable daily Ubuntu security updates, keeping reboots manual")
     args = parser.parse_args()
+    if args.enable_security_updates and args.command != 'install':
+        parser.error('--enable-security-updates is only valid with install')
     path = args.config.expanduser().resolve()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
         if args.command == "setup":
             setup(path)
         elif args.command == "install":
-            install(path)
+            install(path, enable_security_updates=args.enable_security_updates)
         else:
             config = load(path)
             if args.command == "test":

@@ -14,7 +14,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Ubuntu scanner dependencies
-        run: sudo apt-get update && sudo apt-get install -y python3-apt openscap-scanner iproute2
+        run: sudo apt-get update && sudo apt-get install -y python3-apt openscap-scanner iproute2 unattended-upgrades
+      - name: Verify security-only policy and real unattended-upgrade dry run
+        run: sudo /usr/bin/python3 tests/updates_integration.py
+        timeout-minutes: 10
       - name: Check actual APT cache, sockets, and Canonical OVAL assessment
         run: |
           sudo install -d /opt/reimu-ci
