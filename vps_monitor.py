@@ -25,6 +25,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -48,6 +49,8 @@ ENV_FIELDS = {
     "NETWORK_MBPS": ("network_mbps", float, "100"),
 }
 ENV_FIELDS.update(security_checks.ENV_FIELDS)
+SEND_LOCK = threading.Lock()
+SEND_LAST = 0.0
 
 
 def read_env(path):
@@ -140,8 +143,17 @@ def wait_for_pairing(token, code, seconds=180):
 
 
 def send(config, text):
-    api(config["token"], "sendMessage", chat_id=config["chat_id"],
-        text=config["name"] + "\n" + text)
+    global SEND_LAST
+    # Resource and maintenance threads share one chat: avoid startup bursts.
+    with SEND_LOCK:
+        delay = 1.1 - (time.monotonic() - SEND_LAST)
+        if delay > 0:
+            time.sleep(delay)
+        try:
+            api(config["token"], "sendMessage", chat_id=config["chat_id"],
+                text=config["name"] + "\n" + text)
+        finally:
+            SEND_LAST = time.monotonic()
 
 
 def setup(path):

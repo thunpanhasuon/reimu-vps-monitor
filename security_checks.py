@@ -1,6 +1,7 @@
 """Read-only maintenance checks. No upgrades, reboots, or firewall changes."""
 import bz2
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 import hashlib
 import ipaddress
 import json
@@ -196,6 +197,8 @@ def oval_findings(results_path):
         elif name == "test" and element.get("test_id"):
             result_tests[element.get("test_id")] = element
     findings = []
+    if not evaluated or not any(definition.get("class") == "vulnerability" for definition in definitions.values()):
+        raise RuntimeError("OVAL results lack evaluated vulnerability definitions; assessment unavailable")
     for evaluated_definition in evaluated:
         definition = definitions.get(evaluated_definition.get("definition_id"))
         if definition is None or definition.get("class") != "vulnerability":
@@ -235,7 +238,24 @@ def oval_findings(results_path):
     return sorted(findings, key=lambda finding: finding["cve"]), incomplete
 
 
-def cve_scan(directory):
+def verify_feed_age(path):
+    stamp = None
+    for _, element in ET.iterparse(path, events=("end",)):
+        if local_name(element) == "generator":
+            stamp = child_text(element, "timestamp")
+            break
+    try:
+        generated = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        if generated.tzinfo is None:
+            generated = generated.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - generated).total_seconds()
+    except (AttributeError, ValueError):
+        raise RuntimeError("Ubuntu CVE feed has no usable generation timestamp") from None
+    if age > 7 * 86400 or age < -86400:
+        raise RuntimeError("Ubuntu CVE feed is stale or server time is incorrect; assessment unavailable")
+
+
+def cve_scan(directory, keep_results=False):
     if not shutil.which("oscap"):
         raise RuntimeError("CVE scan unavailable: install openscap-scanner")
     release = {}
@@ -260,6 +280,7 @@ def cve_scan(directory):
                 if size > 300 * 1024 * 1024:
                     raise RuntimeError("Expanded OVAL feed exceeded its size limit")
                 output.write(chunk)
+        verify_feed_age(source)
         try:
             with (scratch / "oscap.log").open("w") as log:
                 result = subprocess.run(["oscap", "oval", "eval", "--results", str(results), str(source)],
@@ -267,7 +288,10 @@ def cve_scan(directory):
         except subprocess.TimeoutExpired:
             raise RuntimeError("CVE scan timed out after 15 minutes") from None
         if result.returncode != 0 or not results.exists():
-            raise RuntimeError("OpenSCAP scan failed (exit %s); assessment is unavailable" % result.returncode)
+            shutil.copyfile(scratch / "oscap.log", Path(directory) / "last-oscap-error.log")
+            raise RuntimeError("OpenSCAP scan failed (exit %s); see last-oscap-error.log in the state directory" % result.returncode)
+        if keep_results:
+            shutil.copyfile(results, Path(directory) / "last-oval-results.xml")
         return oval_findings(results)
 
 
