@@ -389,6 +389,21 @@ def reimu_update():
     return ""
 
 
+def cve_snapshot(findings):
+    """Compare security facts, ignoring ordering, timestamps and prose edits."""
+    snapshot = {}
+    for finding in findings:
+        packages = [{
+            'name': package['name'], 'installed': package['installed'],
+            'kind': package.get('kind', 'apt'), 'fixed': sorted(set(package['fixed'])),
+            'fix_status': package.get('fix_status', ''),
+            'potential': 'might' in package.get('assessment', '').lower(),
+        } for package in finding['packages']]
+        snapshot[finding['cve']] = {'severity': finding['severity'],
+                                   'packages': sorted(packages, key=lambda item: json.dumps(item, sort_keys=True))}
+    return snapshot
+
+
 class Maintenance:
     def __init__(self, config, send):
         self.config, self.send = config, send
@@ -507,15 +522,41 @@ class Maintenance:
 
     def cves(self):
         findings, incomplete = cve_scan(self.directory)
-        fingerprint = hashlib.sha256(json.dumps([findings, incomplete], sort_keys=True).encode()).hexdigest()
-        lines = ["🔴 Ubuntu CVE assessment: %s finding(s)" % len(findings)] if findings else ["✅ No matching CVEs found in the current Ubuntu assessment"]
+        snapshot = cve_snapshot(findings)
+        notified = self.directory / 'cve-notified.json'
+        full_report = self.directory / 'cve-findings.json'
+        previous = json.loads(notified.read_text()) if notified.exists() else None
+        # Migrate an already-delivered legacy report without resending its top CVEs.
+        if previous is None and full_report.exists():
+            legacy = json.loads(full_report.read_text())
+            fingerprint = hashlib.sha256(json.dumps([legacy['findings'], legacy['incomplete']], sort_keys=True).encode()).hexdigest()
+            with self.lock:
+                delivered = self.state.get('cves') == fingerprint
+            if delivered:
+                previous = {'findings': cve_snapshot(legacy['findings']), 'incomplete': legacy['incomplete']}
+                atomic_json(notified, previous)
+        old = previous['findings'] if previous is not None else {}
+        added = set(snapshot) - set(old)
+        changed = {cve for cve in set(snapshot) & set(old) if snapshot[cve] != old[cve]}
+        removed = (set(old) - set(snapshot)) if not incomplete else set()
+        selected = findings if previous is None else [finding for finding in findings if finding['cve'] in added | changed]
+        lines = []
+        if previous is None:
+            lines = ['🔴 Initial Ubuntu CVE assessment: %s finding(s)' % len(findings)] if findings else ['✅ No matching CVEs found in the current Ubuntu assessment']
+        elif added or changed or removed:
+            lines = ['🔔 CVE changes: %s new, %s changed, %s no longer matching.' % (len(added), len(changed), len(removed)),
+                     'Current assessment: %s matching CVEs. Unchanged findings are omitted.' % len(snapshot)]
+            if removed:
+                lines.append('No longer matching does not prove a fix was installed; package changes or revised vulnerability data can also explain it.')
+        elif incomplete != previous.get('incomplete'):
+            lines = ['⚠️ CVE scan is incomplete' if incomplete else 'ℹ️ CVE scan is complete again; no finding changes.']
         if incomplete:
-            lines[0] = "⚠️ Ubuntu CVE assessment incomplete: %s finding(s)" % len(findings)
-        lines.append("Scope: Ubuntu APT packages; severity is Canonical's rating. Not an all-software safety guarantee.")
-        if incomplete:
-            lines.append("⚠️ %s definitions could not be evaluated; scan is incomplete." % incomplete)
-        # Group findings instead of sending hundreds of individual alerts.
-        ordered = sorted(findings, key=lambda item: ({"Critical": 0, "High": 1, "Medium": 2, "Low": 3}.get(item["severity"], 4), item["cve"]))
+            if lines:
+                lines[0] = '⚠️ Incomplete CVE scan: ' + lines[0].lstrip('🔴🔔✅⚠️ ')
+                lines.append('%s definitions could not be evaluated. Missing findings are not marked resolved.' % incomplete)
+        if lines:
+            lines.append("Scope: Ubuntu packages/running kernel; Canonical severity. Not an all-software safety guarantee.")
+        ordered = sorted(selected, key=lambda item: ({"Critical": 0, "High": 1, "Medium": 2, "Low": 3}.get(item["severity"], 4), item["cve"]))
         for finding in ordered[:8]:
             lines.append("\n%s — %s" % (finding["cve"], finding["severity"]))
             for package in finding["packages"][:3]:
@@ -525,11 +566,15 @@ class Maintenance:
                 if "might" in package["assessment"]:
                     lines.append("Ubuntu marks this as potentially affected; review advisory.")
             lines.append("https://ubuntu.com/security/" + finding["cve"])
-        if len(findings) > 8:
-            lines.append("\nShowing 8 of %s; full findings saved on VPS." % len(findings))
-        atomic_json(self.directory / "cve-findings.json", {"checked_at": time.time(), "findings": findings, "incomplete": incomplete})
-        # First clean scan confirms that the CVE feature is active.
-        self.notify("cves", fingerprint, lines)
+        if len(selected) > 8:
+            lines.append('\nShowing 8 of %s relevant findings; full assessment saved on VPS.' % len(selected))
+        atomic_json(full_report, {'checked_at': time.time(), 'findings': findings, 'incomplete': incomplete})
+        # Preserve unobserved prior findings across an incomplete scan.
+        baseline = {**old, **snapshot} if incomplete else snapshot
+        next_report = {'findings': baseline, 'incomplete': incomplete}
+        fingerprint = hashlib.sha256(json.dumps(next_report, sort_keys=True).encode()).hexdigest()
+        self.notify('cves', fingerprint, lines)
+        atomic_json(notified, next_report)
 
     def version(self):
         commit = reimu_update()

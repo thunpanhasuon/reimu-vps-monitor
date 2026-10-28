@@ -94,7 +94,14 @@ An old vulnerable kernel package can match even when a newer kernel is
 running; assess the listed installed package and reboot status together.
 
 Alerts show at most eight CVEs per summary, with higher Canonical severities
-first. Full findings are saved privately at
+first. After the initial scan, alerts show only newly matching CVEs or changes
+to severity, affected installed versions, fixed versions, or fix availability.
+Unchanged CVEs stay quiet even if the overall count changes. Findings that no
+longer match are summarized without resending the old critical list; this can
+reflect revised vulnerability data as well as package changes, so it is not
+proof that a fix was installed. Incomplete scans do not mark missing findings
+as resolved. Existing delivered reports are migrated without another full alert.
+Full findings are saved privately at
 `/var/lib/reimu-vps/cve-findings.json`. Scan errors and incomplete evaluations
 are explicitly reported. Feeds more than seven days old are rejected rather
 than treated as current. Review advisories before installing fixes.

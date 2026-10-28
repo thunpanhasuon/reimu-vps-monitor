@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -13,6 +14,71 @@ import vps_monitor as monitor
 
 
 class SecurityTests(unittest.TestCase):
+    @staticmethod
+    def finding(cve, severity='Critical'):
+        return {'cve': cve, 'severity': severity, 'packages': [
+            {'name': 'example', 'installed': '1', 'fixed': [], 'assessment': 'affected', 'kind': 'apt'}]}
+
+    def test_cve_change_alert_omits_unchanged_critical_findings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sent = []
+            checker = security.Maintenance({'state_directory': directory}, lambda config, text: sent.append(text))
+            old = self.finding('CVE-2099-11111')
+            new = self.finding('CVE-2099-22222', 'Low')
+            with patch.object(security, 'cve_scan', return_value=([old], 0)):
+                checker.cves()
+            sent.clear()
+            with patch.object(security, 'cve_scan', return_value=([old, new], 0)):
+                checker.cves()
+                checker.cves()
+            self.assertEqual(len(sent), 1)
+            self.assertIn('CVE-2099-22222', sent[0])
+            self.assertNotIn('CVE-2099-11111', sent[0])
+
+    def test_legacy_cve_report_migrates_without_repeat(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sent = []
+            findings = [self.finding('CVE-2099-11111')]
+            fingerprint = hashlib.sha256(json.dumps([findings, 0], sort_keys=True).encode()).hexdigest()
+            security.atomic_json(Path(directory) / 'state.json', {'cves': fingerprint})
+            security.atomic_json(Path(directory) / 'cve-findings.json', {'findings': findings, 'incomplete': 0})
+            checker = security.Maintenance({'state_directory': directory}, lambda config, text: sent.append(text))
+            with patch.object(security, 'cve_scan', return_value=(findings, 0)):
+                checker.cves()
+            self.assertEqual(sent, [])
+            self.assertTrue((Path(directory) / 'cve-notified.json').exists())
+
+    def test_incomplete_scan_does_not_report_missing_cve_as_resolved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sent = []
+            checker = security.Maintenance({'state_directory': directory}, lambda config, text: sent.append(text))
+            old = self.finding('CVE-2099-11111')
+            with patch.object(security, 'cve_scan', return_value=([old], 0)):
+                checker.cves()
+            sent.clear()
+            with patch.object(security, 'cve_scan', return_value=([], 1)):
+                checker.cves()
+            self.assertNotIn('1 no longer matching', sent[0])
+            baseline = json.loads((Path(directory) / 'cve-notified.json').read_text())
+            self.assertIn('CVE-2099-11111', baseline['findings'])
+
+    def test_failed_cve_notification_keeps_previous_baseline_for_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sent = []
+            checker = security.Maintenance({'state_directory': directory}, lambda config, text: sent.append(text))
+            old = self.finding('CVE-2099-11111')
+            new = self.finding('CVE-2099-22222')
+            with patch.object(security, 'cve_scan', return_value=([old], 0)):
+                checker.cves()
+            previous = (Path(directory) / 'cve-notified.json').read_text()
+            def failed(config, text):
+                raise RuntimeError('offline')
+            checker.send = failed
+            with patch.object(security, 'cve_scan', return_value=([old, new], 0)):
+                with self.assertRaises(RuntimeError):
+                    checker.cves()
+            self.assertEqual((Path(directory) / 'cve-notified.json').read_text(), previous)
+
     def test_tailscale_reminder_checkpoints_and_invalid_date(self):
         self.assertIsNone(security.tailscale_reminder('2027-04-26', date(2027, 3, 26)))
         for today, stage in [(date(2027, 3, 27), '30'), (date(2027, 4, 12), '14'),
