@@ -13,6 +13,7 @@ import argparse
 import getpass
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import pwd
@@ -28,6 +29,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import security_checks
 
 LOG = logging.getLogger("vps-monitor")
 DEFAULT_CONFIG = Path(__file__).resolve().parent / ".env"
@@ -45,6 +47,7 @@ ENV_FIELDS = {
     "NETWORK_INTERFACE": ("network_interface", str, "auto"),
     "NETWORK_MBPS": ("network_mbps", float, "100"),
 }
+ENV_FIELDS.update(security_checks.ENV_FIELDS)
 
 
 def read_env(path):
@@ -187,13 +190,21 @@ def load(path):
         if not config.get(key):
             raise RuntimeError("Missing configuration field: " + key)
     for key in ("interval_seconds", "sustained_seconds", "reminder_seconds"):
-        if not isinstance(config.get(key), (int, float)) or config[key] < 1:
+        if not isinstance(config.get(key), (int, float)) or not math.isfinite(config[key]) or config[key] < 1:
             raise RuntimeError("Invalid positive setting: " + key)
     for key in ("cpu_percent", "ram_percent", "disk_percent"):
         if not isinstance(config.get(key), (int, float)) or not 1 <= config[key] <= 100:
             raise RuntimeError("Invalid percentage: " + key)
-    if not isinstance(config.get("network_mbps"), (int, float)) or config["network_mbps"] < 0:
+    if not isinstance(config.get("network_mbps"), (int, float)) or not math.isfinite(config["network_mbps"]) or config["network_mbps"] < 0:
         raise RuntimeError("network_mbps must be nonnegative; 0 disables traffic alerts.")
+    for key in ("maintenance_interval", "cve_interval", "port_interval"):
+        if config[key] < 30:
+            raise RuntimeError(key + " must be at least 30 seconds")
+    for entry in config["expected_ports"].split(","):
+        if entry.strip() and not re.fullmatch(r"(?:tcp|udp):(?:[0-9]{1,5})", entry.strip()):
+            raise RuntimeError("EXPECTED_PORTS must contain comma-separated tcp:PORT or udp:PORT entries")
+        if entry.strip() and not 1 <= int(entry.strip().split(":")[1]) <= 65535:
+            raise RuntimeError("EXPECTED_PORTS contains an invalid port")
     return config
 
 
@@ -278,6 +289,8 @@ def monitor(config):
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+    maintenance = security_checks.Maintenance(config, send)
+    maintenance.start()
     LOG.info("Monitoring %s on interface %s", config["name"], nic)
     while not stopping:
         # Interruptible wait, with metrics sampled over the full interval.
@@ -308,24 +321,46 @@ def monitor(config):
         except (RuntimeError, OSError, ValueError, KeyError) as exc:
             # Only our sanitized Telegram errors and local metric errors reach this log.
             LOG.warning("%s; retrying next interval", exc)
+    maintenance.stop.set()
     LOG.info("Monitor stopped")
 
 
-def install(path):
+def install(path, root=Path("/")):
     if os.geteuid() != 0:
         raise RuntimeError("Installation needs sudo. Setup and testing do not.")
-    load(path)
+    config = load(path)
+    # Read before opening the destination: updates may use the installed .env itself.
+    private_config = path.read_bytes()
+    if config["state_directory"] not in ("", "/var/lib/reimu-vps"):
+        raise RuntimeError("Installed service requires STATE_DIRECTORY=/var/lib/reimu-vps")
     owner = pwd.getpwuid(path.stat().st_uid)
-    dest = Path("/opt/reimu-vps")
+    source = Path(__file__).resolve().parent
+    try:
+        commit = subprocess.run(["git", "-c", "safe.directory=" + str(source), "-C", str(source), "rev-parse", "HEAD"],
+                                check=True, capture_output=True, text=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        raise RuntimeError("Install from a Git clone so Reimu can track its installed version") from None
+    if not re.fullmatch(r"[0-9a-f]{40,64}", commit):
+        raise RuntimeError("Invalid Git build identity")
+    dest = root / "opt/reimu-vps"
     dest.mkdir(mode=0o755, parents=True, exist_ok=True)
     shutil.copyfile(Path(__file__).resolve(), dest / "vps_monitor.py")
     os.chmod(dest / "vps_monitor.py", 0o644)
-    target = Path("/etc/reimu-vps.env")
-    descriptor = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    os.fchmod(descriptor, 0o600)
+    shutil.copyfile(Path(__file__).resolve().parent / "security_checks.py", dest / "security_checks.py")
+    os.chmod(dest / "security_checks.py", 0o644)
+    (dest / "build.json").write_text(json.dumps({"commit": commit}))
+    target = root / "etc/reimu-vps.env"
+    descriptor, temporary = security_checks.tempfile.mkstemp(dir=target.parent, prefix=".reimu-env-")
     with os.fdopen(descriptor, "wb") as output:
-        output.write(path.read_bytes())
+        output.write(private_config)
+        # StateDirectory is writable despite the service sandbox.
+        if not config["state_directory"]:
+            output.write(b"\nSTATE_DIRECTORY=/var/lib/reimu-vps\n")
+    os.replace(temporary, target)
     os.chown(target, owner.pw_uid, owner.pw_gid)
+    state = root / "var/lib/reimu-vps"
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chown(state, owner.pw_uid, owner.pw_gid)
     unit = """[Unit]
 Description=Reimu VPS Telegram Monitor
 Wants=network-online.target
@@ -342,6 +377,9 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+StateDirectory=reimu-vps
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/reimu-vps
 CapabilityBoundingSet=
 RestrictSUIDSGID=true
 UMask=0077
@@ -349,9 +387,37 @@ UMask=0077
 [Install]
 WantedBy=multi-user.target
 """ % owner.pw_name
-    Path("/etc/systemd/system/reimu-vps.service").write_text(unit)
+    (root / "etc/systemd/system").mkdir(parents=True, exist_ok=True)
+    (root / "etc/systemd/system/reimu-vps.service").write_text(unit)
+    (root / "etc/systemd/system/reimu-apt-refresh.service").write_text("""[Unit]
+Description=Refresh APT metadata for Reimu alerts (no package upgrades)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/apt-get -o APT::Update::Error-Mode=any update
+ExecStartPost=/usr/bin/touch /var/lib/apt/periodic/update-success-stamp
+TimeoutStartSec=300
+Nice=10
+""")
+    (root / "etc/systemd/system/reimu-apt-refresh.timer").write_text("""[Unit]
+Description=Refresh package lists daily for Reimu
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1800
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+""")
+    (root / "var/lib/apt/periodic").mkdir(parents=True, exist_ok=True)
     subprocess.run(["systemctl", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "enable", "--now", "reimu-apt-refresh.timer"], check=True)
+    subprocess.run(["systemctl", "start", "--no-block", "reimu-apt-refresh.service"], check=True)
     subprocess.run(["systemctl", "enable", "--now", "reimu-vps.service"], check=True)
+    subprocess.run(["systemctl", "restart", "reimu-vps.service"], check=True)
     print("Installed. Runs after SSH disconnects and starts at boot.")
     print("Status: sudo systemctl status reimu-vps --no-pager")
     print("Logs:   sudo journalctl -u reimu-vps -n 30 --no-pager")
@@ -361,7 +427,7 @@ WantedBy=multi-user.target
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=["setup", "test", "run", "install"])
+    parser.add_argument("command", choices=["setup", "test", "run", "install", "check"])
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     args = parser.parse_args()
     path = args.config.expanduser().resolve()
@@ -376,6 +442,12 @@ def main():
             if args.command == "test":
                 send(config, "✅ Test successful. This VPS can send Telegram alerts.")
                 print("Test sent. Check Telegram.")
+            elif args.command == "check":
+                checks = security_checks.Maintenance(config, send)
+                for name, action in (("updates", checks.updates), ("reboot", checks.reboot),
+                                     ("ports", checks.ports), ("version", checks.version), ("CVEs", checks.cves)):
+                    checks.guarded(name, action)
+                print("Checks completed. Inspect Telegram and logs for findings or unavailable checks.")
             else:
                 monitor(config)
     except KeyboardInterrupt:

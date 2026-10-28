@@ -8,6 +8,8 @@ Python 3.8+ and systemd; no pip packages, domain, or inbound ports required.
 Clone this repository, enter its directory, then run:
 
 ```bash
+sudo apt-get update
+sudo apt-get install -y python3-apt openscap-scanner iproute2
 cp .env.example .env
 chmod 600 .env
 nano .env
@@ -18,7 +20,7 @@ Paste your bot token after `TELEGRAM_BOT_TOKEN=` and save. Leave
 Git ignores it. The committed `.env.example` contains placeholders only.
 
 ```bash
-python3 vps_monitor.py setup
+/usr/bin/python3 vps_monitor.py setup
 ```
 
 Open your bot in Telegram, press Start, and send the exact pairing code
@@ -26,8 +28,8 @@ displayed in your SSH terminal. Setup waits up to three minutes and saves
 your chat ID. It preserves the other settings already in `.env`.
 
 ```bash
-python3 vps_monitor.py test
-sudo python3 vps_monitor.py install --config "$PWD/.env"
+/usr/bin/python3 vps_monitor.py test
+sudo /usr/bin/python3 vps_monitor.py install --config "$PWD/.env"
 sudo systemctl status reimu-vps --no-pager
 ```
 
@@ -36,6 +38,86 @@ configuration to `/etc/reimu-vps.env`, and starts `reimu-vps.service`.
 The service runs as the owner of your `.env` file, starts after reboot,
 and continues when SSH disconnects. Do not also run a second foreground
 monitor, or you will receive duplicate alerts.
+
+The installer also enables a daily `reimu-apt-refresh.timer`. It refreshes
+APT package metadata only; it does not install package upgrades. The
+maintenance checks use Ubuntu's system Python and the official APT and
+OpenSCAP packages listed above. A separate Ubuntu package such as
+unattended-upgrades may already apply updates independently of Reimu.
+
+## Update an existing installation
+
+```bash
+git pull --ff-only
+sudo apt-get update
+sudo apt-get install -y python3-apt openscap-scanner iproute2
+sudo /usr/bin/python3 vps_monitor.py install --config /etc/reimu-vps.env
+sudo systemctl status reimu-vps --no-pager
+```
+
+The installer preserves the installed credentials, restarts the service,
+and uses defaults for any new settings missing from your older `.env`.
+Do not run `setup` again just to update. Installed build identity is
+recorded so update notifications compare against the version actually running.
+
+## Maintenance and security alerts
+
+| Check | Default frequency | Behavior |
+| --- | --- | --- |
+| Package and security updates | Every 6 hours | Reports pending APT packages and versions, with security-origin labels |
+| Reboot required | Every minute | Reports Ubuntu's reboot-required flag and when it clears |
+| Ubuntu CVEs | Daily | Downloads Canonical CVE OVAL data and evaluates installed packages using OpenSCAP |
+| Reimu updates | Every 6 hours | Checks GitHub main against the installed Git commit |
+| Listening-port changes | Every minute | Reports new or stopped TCP/UDP listeners and binding changes |
+
+Checks run on startup, then at these intervals. Only changed results are
+reported. State persists under `/var/lib/reimu-vps`, so restarting does not
+repeat unchanged maintenance alerts. These checks run separately from CPU
+sampling. A failed check is reported as unavailable, never as an all-clear.
+
+The first port check records and reports a baseline. `EXPECTED_PORTS=tcp:22`
+suppresses expected new SSH listeners; it still reports a port changing from
+localhost to a non-loopback address. Stopped listeners are reported. Listening
+on a non-loopback address is **not proof of internet reachability**; Reimu does
+not change or probe firewalls. Process names may be unavailable for processes
+owned by another user. Short-lived listeners between checks may be missed.
+
+CVE alerts show the Canonical severity, CVE ID, installed package evidence,
+and the fixed package version when supplied by the assessment. A fixed
+version in Canonical's data is not a promise it is available in your enabled
+repositories; some fixes require Ubuntu Pro/ESM. Potentially affected packages
+are labeled as such. This covers Ubuntu APT package assessments, not pip/npm
+dependencies, Docker images, custom builds, or every third-party PPA.
+An old vulnerable kernel package can match even when a newer kernel is
+running; assess the listed installed package and reboot status together.
+
+Alerts show at most eight CVEs per summary, with higher Canonical severities
+first. Full findings are saved privately at
+`/var/lib/reimu-vps/cve-findings.json`. Scan errors and incomplete evaluations
+are explicitly reported. Review advisories before installing fixes.
+
+Sources: [Canonical OVAL documentation](https://documentation.ubuntu.com/security/security-updates/oval/)
+and [official Ubuntu feeds](https://security-metadata.canonical.com/oval/).
+
+Configuration switches and intervals are listed in `.env.example`. They are
+optional in existing `.env` files; sensible defaults apply. Change the installed
+configuration and restart the service to override them. To run checks manually:
+
+```bash
+/usr/bin/python3 /opt/reimu-vps/vps_monitor.py check --config /etc/reimu-vps.env
+```
+
+Run as the service's user (normally your SSH user) to access its private state.
+Avoid running manual checks concurrently with the service. GitHub errors,
+missing dependencies, and unavailable Ubuntu feeds produce a check-unavailable
+alert. Package metadata older than 48 hours or without a successful-refresh
+stamp produces a freshness warning.
+
+To disable the metadata timer:
+
+```bash
+sudo systemctl disable --now reimu-apt-refresh.timer
+```
 
 ## Alerts
 

@@ -9,3 +9,12 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m unittest discover -s tests -v
+  ubuntu-integration:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Ubuntu scanner dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-apt openscap-scanner iproute2
+      - name: Check actual APT cache, sockets, and Canonical OVAL assessment
+        run: /usr/bin/python3 tests/linux_integration.py
+        timeout-minutes: 20
