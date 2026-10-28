@@ -122,6 +122,26 @@ To disable the metadata timer:
 sudo systemctl disable --now reimu-apt-refresh.timer
 ```
 
+## Tailscale key-expiry reminder
+
+Save your device-key expiry date during an installation/update:
+
+```bash
+sudo /usr/bin/python3 vps_monitor.py install --config /etc/reimu-vps.env --tailscale-key-expiry 2027-04-26
+```
+
+You can combine that option with `--enable-security-updates`. The date is saved
+in the installed `.env`, while existing credentials and settings are preserved.
+Reimu checks hourly using the Cambodia calendar date. It sends reminders at
+30, 14, 7, 3 and 1 days before expiry, on the expiry day, and once afterward.
+If a checkpoint was missed, the next check warns for the current window.
+Reminders persist across service restarts without repeating the same window.
+
+This is a reminder based on your supplied date, not live verification of
+Tailscale status. It does not renew keys. After renewal, edit
+`TAILSCALE_KEY_EXPIRY` in `/etc/reimu-vps.env` and restart Reimu. Leave the value
+empty to disable reminders. The exact expiry time is unknown, so renew early.
+
 ## Optional automatic Ubuntu security updates
 
 To enable the security-only updater (opt-in; ordinary installs do not enable it):

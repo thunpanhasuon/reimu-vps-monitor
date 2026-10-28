@@ -217,6 +217,11 @@ def load(path):
             raise RuntimeError("EXPECTED_PORTS must contain comma-separated tcp:PORT or udp:PORT entries")
         if entry.strip() and not 1 <= int(entry.strip().split(":")[1]) <= 65535:
             raise RuntimeError("EXPECTED_PORTS contains an invalid port")
+    if config['tailscale_key_expiry']:
+        try:
+            security_checks.tailscale_reminder(config['tailscale_key_expiry'])
+        except ValueError:
+            raise RuntimeError('TAILSCALE_KEY_EXPIRY must be a valid YYYY-MM-DD date') from None
     return config
 
 
@@ -337,7 +342,7 @@ def monitor(config):
     LOG.info("Monitor stopped")
 
 
-def install(path, root=Path("/"), enable_security_updates=False):
+def install(path, root=Path("/"), enable_security_updates=False, tailscale_key_expiry=None):
     if os.geteuid() != 0:
         raise RuntimeError("Installation needs sudo. Setup and testing do not.")
     config = load(path)
@@ -345,6 +350,12 @@ def install(path, root=Path("/"), enable_security_updates=False):
         raise RuntimeError('Install unattended-upgrades first: sudo apt-get install unattended-upgrades')
     # Read before opening the destination: updates may use the installed .env itself.
     private_config = path.read_bytes()
+    if tailscale_key_expiry is not None:
+        try:
+            security_checks.tailscale_reminder(tailscale_key_expiry)
+        except ValueError:
+            raise RuntimeError('--tailscale-key-expiry must be a valid YYYY-MM-DD date') from None
+        private_config += ('\nTAILSCALE_KEY_EXPIRY=' + tailscale_key_expiry + '\n').encode()
     if config["state_directory"] not in ("", "/var/lib/reimu-vps"):
         raise RuntimeError("Installed service requires STATE_DIRECTORY=/var/lib/reimu-vps")
     owner = pwd.getpwuid(path.stat().st_uid)
@@ -453,16 +464,20 @@ def main():
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--enable-security-updates", action="store_true",
                         help="With install: enable daily Ubuntu security updates, keeping reboots manual")
+    parser.add_argument('--tailscale-key-expiry', help='With install: save the supplied expiry date (YYYY-MM-DD)')
     args = parser.parse_args()
     if args.enable_security_updates and args.command != 'install':
         parser.error('--enable-security-updates is only valid with install')
+    if args.tailscale_key_expiry is not None and args.command != 'install':
+        parser.error('--tailscale-key-expiry is only valid with install')
     path = args.config.expanduser().resolve()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
         if args.command == "setup":
             setup(path)
         elif args.command == "install":
-            install(path, enable_security_updates=args.enable_security_updates)
+            install(path, enable_security_updates=args.enable_security_updates,
+                    tailscale_key_expiry=args.tailscale_key_expiry)
         else:
             config = load(path)
             if args.command == "test":

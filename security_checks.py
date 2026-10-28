@@ -1,7 +1,7 @@
 """Read-only maintenance checks. No upgrades, reboots, or firewall changes."""
 import bz2
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import ipaddress
 import json
@@ -37,7 +37,23 @@ ENV_FIELDS = {
     "PORT_INTERVAL_SECONDS": ("port_interval", int, "60"),
     "EXPECTED_PORTS": ("expected_ports", str, "tcp:22"),
     "STATE_DIRECTORY": ("state_directory", str, ""),
+    "TAILSCALE_KEY_EXPIRY": ("tailscale_key_expiry", str, ""),
 }
+
+
+def tailscale_reminder(expiry, today=None):
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", expiry):
+        raise ValueError('TAILSCALE_KEY_EXPIRY must use YYYY-MM-DD')
+    expires = date.fromisoformat(expiry)
+    today = today or datetime.now(timezone(timedelta(hours=7))).date()
+    days = (expires - today).days
+    if days > 30:
+        return None
+    if days < 0:
+        return 'passed', '⚠️ Configured Tailscale key expiry (%s) has passed. Verify access and renew/re-authenticate the device.' % expiry
+    stage = next(str(limit) for limit in (0, 1, 3, 7, 14, 30) if days <= limit)
+    when = 'today' if days == 0 else 'in %s day(s)' % days
+    return stage, '🔑 Tailscale key expires %s (%s). Renew/re-authenticate before expiry to preserve remote access.' % (when, expiry)
 
 
 def command(args, timeout=60):
@@ -416,6 +432,21 @@ class Maintenance:
         packages = reboot_required()
         self.notify("reboot", packages, ["🔔 Reboot required: " + ", ".join(packages)] if packages else ["✅ Reboot-required flag cleared"], baseline=not packages)
 
+    def tailscale_expiry(self):
+        expiry = self.config['tailscale_key_expiry']
+        self.notify('tailscale_expiry_configuration', expiry,
+                    ['🔑 Tailscale key-expiry reminder configured: ' + expiry,
+                     'Uses your supplied date, not a live Tailscale check. Reminders at 30, 14, 7, 3 and 1 days, on expiry day, and after expiry.']
+                    if expiry else ['Tailscale key-expiry reminders disabled.'], baseline=not expiry)
+        if not expiry:
+            self.notify('tailscale_expiry_stage', '', [])
+            return
+        reminder = tailscale_reminder(expiry)
+        if reminder is not None:
+            stage, text = reminder
+            self.notify('tailscale_expiry_stage', expiry + ':' + stage,
+                        [text, 'Exact expiry time is not known. Update TAILSCALE_KEY_EXPIRY in /etc/reimu-vps.env after renewal, then restart Reimu.'])
+
     def automatic_updates(self, directory=Path('/var/lib/reimu-security-updates')):
         configuration = directory / 'configuration.json'
         if not configuration.exists():
@@ -519,7 +550,8 @@ class Maintenance:
                 LOG.warning("Could not deliver maintenance failure notification")
 
     def run(self):
-        tasks = {"reboot": (60, self.reboot), "automatic updates": (60, self.automatic_updates)}
+        tasks = {"reboot": (60, self.reboot), "automatic updates": (60, self.automatic_updates),
+                 "Tailscale expiry": (3600, self.tailscale_expiry)}
         if self.config["port_alerts"]:
             tasks["ports"] = (self.config["port_interval"], self.ports)
         if self.config["update_alerts"]:

@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from unittest.mock import patch
 
 import security_checks as security
@@ -13,6 +13,27 @@ import vps_monitor as monitor
 
 
 class SecurityTests(unittest.TestCase):
+    def test_tailscale_reminder_checkpoints_and_invalid_date(self):
+        self.assertIsNone(security.tailscale_reminder('2027-04-26', date(2027, 3, 26)))
+        for today, stage in [(date(2027, 3, 27), '30'), (date(2027, 4, 12), '14'),
+                             (date(2027, 4, 19), '7'), (date(2027, 4, 23), '3'),
+                             (date(2027, 4, 25), '1'), (date(2027, 4, 26), '0'),
+                             (date(2027, 4, 27), 'passed')]:
+            with self.subTest(today=today):
+                self.assertEqual(security.tailscale_reminder('2027-04-26', today)[0], stage)
+        with self.assertRaises(ValueError):
+            security.tailscale_reminder('2027-02-29')
+
+    def test_tailscale_reminder_does_not_repeat_after_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = {'state_directory': directory, 'tailscale_key_expiry': '2027-04-26'}
+            sent = []
+            for _ in range(2):
+                checker = security.Maintenance(config, lambda config, text: sent.append(text))
+                with patch.object(security, 'tailscale_reminder', return_value=('14', 'Expiry reminder')):
+                    checker.tailscale_expiry()
+            self.assertEqual(sum(text.startswith('Expiry reminder') for text in sent), 1)
+
     def test_auto_update_reports_changes_once_and_quiet_empty_runs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -160,8 +181,9 @@ udp UNCONN 0 0 127.0.0.53%lo:53 0.0.0.0:*
             def run(args, **kwargs):
                 return subprocess.CompletedProcess(args, 0, stdout='a' * 40 + '\n')
             with patch.object(monitor.os, 'geteuid', return_value=0), patch.object(monitor.os, 'chown'), patch.object(monitor.subprocess, 'run', side_effect=run), patch('builtins.print'):
-                monitor.install(path, root=root)
+                monitor.install(path, root=root, tailscale_key_expiry='2027-04-26')
             self.assertIn('TELEGRAM_BOT_TOKEN=123:example', path.read_text())
+            self.assertEqual(monitor.read_env(path)['TAILSCALE_KEY_EXPIRY'], '2027-04-26')
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertTrue((root / 'opt/reimu-vps/security_checks.py').exists())
 
