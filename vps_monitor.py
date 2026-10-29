@@ -31,6 +31,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import security_checks
+from alert_format import format_alert
 
 LOG = logging.getLogger("vps-monitor")
 DEFAULT_CONFIG = Path(__file__).resolve().parent / ".env"
@@ -49,6 +50,7 @@ ENV_FIELDS = {
     "NETWORK_MBPS": ("network_mbps", float, "100"),
 }
 ENV_FIELDS.update(security_checks.ENV_FIELDS)
+RETIRED_SETTINGS = {'CVE_ALERTS', 'CVE_INTERVAL_SECONDS'}
 SEND_LOCK = threading.Lock()
 SEND_LAST = 0.0
 
@@ -62,6 +64,8 @@ def read_env(path):
         if not line or line.startswith("#"):
             continue
         key, separator, value = line.partition("=")
+        if separator and key.strip() in RETIRED_SETTINGS:
+            continue
         if not separator or key.strip() not in ENV_FIELDS:
             raise RuntimeError("Invalid .env setting on line %d" % number)
         value = value.strip()
@@ -151,7 +155,8 @@ def send(config, text):
             time.sleep(delay)
         try:
             api(config["token"], "sendMessage", chat_id=config["chat_id"],
-                text=config["name"] + "\n" + text)
+                text=format_alert(config, text), parse_mode='HTML',
+                link_preview_options=json.dumps({'is_disabled': True}))
         finally:
             SEND_LAST = time.monotonic()
 
@@ -209,7 +214,7 @@ def load(path):
             raise RuntimeError("Invalid percentage: " + key)
     if not isinstance(config.get("network_mbps"), (int, float)) or not math.isfinite(config["network_mbps"]) or config["network_mbps"] < 0:
         raise RuntimeError("network_mbps must be nonnegative; 0 disables traffic alerts.")
-    for key in ("maintenance_interval", "cve_interval", "port_interval"):
+    for key in ("maintenance_interval", "port_interval"):
         if config[key] < 30:
             raise RuntimeError(key + " must be at least 30 seconds")
     for entry in config["expected_ports"].split(","):
@@ -322,17 +327,28 @@ def monitor(config):
             previous = current
             now = time.monotonic()
             if startup_pending:
-                send(config, "🟢 Monitoring started on " + socket.gethostname())
+                send(config, "🟢 Monitoring started\nHost: " + socket.gethostname())
                 startup_pending = False
-            summary = "\n".join("%s: %.1f %s" % (key, value, "Mbps" if "traffic" in key else "%")
-                                for key, value in values.items())
+            rows = []
+            for key, value in values.items():
+                unit = '%'
+                if 'traffic' in key:
+                    unit = 'Mbps'
+                    if value < 1:
+                        value, unit = value * 1000, 'Kbps'
+                rows.append('%s: %.1f %s' % (key, value, unit))
+            summary = '\n'.join(rows)
             for key, threshold in limits.items():
                 alert = alerts[key]
                 event = alert.check(values[key], threshold, now,
                                     config["sustained_seconds"], config["reminder_seconds"])
                 if event:
                     note = "\nTraffic threshold exceeded; this alone does not confirm a DoS attack." if "traffic" in key else ""
-                    send(config, event + " — " + key + "\n" + summary + note)
+                    unit = 'Mbps' if 'traffic' in key else '%'
+                    context = ('Recovery: Below %.1f %s' % (threshold * 0.95, unit)
+                               if 'RECOVERED' in event else
+                               'Threshold: %.1f %s\nDuration: At least %s seconds' % (threshold, unit, config['sustained_seconds']))
+                    send(config, event + " — " + key + "\n\n" + summary + '\n' + context + note)
                     alert.delivered(event, now)
                     LOG.info("%s: %s", key, event)
         except (RuntimeError, OSError, ValueError, KeyError) as exc:
@@ -349,7 +365,8 @@ def install(path, root=Path("/"), enable_security_updates=False, tailscale_key_e
     if enable_security_updates and not Path('/usr/bin/unattended-upgrade').exists():
         raise RuntimeError('Install unattended-upgrades first: sudo apt-get install unattended-upgrades')
     # Read before opening the destination: updates may use the installed .env itself.
-    private_config = path.read_bytes()
+    private_config = ('\n'.join(line for line in path.read_text().splitlines()
+                       if line.partition('=')[0].strip() not in RETIRED_SETTINGS) + '\n').encode()
     if tailscale_key_expiry is not None:
         try:
             security_checks.tailscale_reminder(tailscale_key_expiry)
@@ -373,6 +390,8 @@ def install(path, root=Path("/"), enable_security_updates=False, tailscale_key_e
     os.chmod(dest / "vps_monitor.py", 0o644)
     shutil.copyfile(Path(__file__).resolve().parent / "security_checks.py", dest / "security_checks.py")
     os.chmod(dest / "security_checks.py", 0o644)
+    shutil.copyfile(source / 'alert_format.py', dest / 'alert_format.py')
+    os.chmod(dest / 'alert_format.py', 0o644)
     shutil.copyfile(source / "security_updater.py", dest / "security_updater.py")
     os.chmod(dest / "security_updater.py", 0o644)
     (dest / "build.json").write_text(json.dumps({"commit": commit}))
@@ -486,7 +505,7 @@ def main():
             elif args.command == "check":
                 checks = security_checks.Maintenance(config, send)
                 for name, action in (("updates", checks.updates), ("reboot", checks.reboot),
-                                     ("ports", checks.ports), ("version", checks.version), ("CVEs", checks.cves)):
+                                     ("ports", checks.ports), ("version", checks.version)):
                     checks.guarded(name, action)
                 print("Checks completed. Inspect Telegram and logs for findings or unavailable checks.")
             else:

@@ -1,21 +1,17 @@
 """Read-only maintenance checks. No upgrades, reboots, or firewall changes."""
-import bz2
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
-import hashlib
 import ipaddress
 import json
 import logging
 import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import tempfile
 import threading
 import time
 import urllib.request
-import xml.etree.ElementTree as ET
 
 LOG = logging.getLogger("reimu-maintenance")
 REPOSITORY = "thunpanhasuon/reimu-vps-monitor"
@@ -29,11 +25,9 @@ def boolean(value):
 
 ENV_FIELDS = {
     "UPDATE_ALERTS": ("update_alerts", boolean, "true"),
-    "CVE_ALERTS": ("cve_alerts", boolean, "true"),
     "REIMU_UPDATE_ALERTS": ("reimu_update_alerts", boolean, "true"),
     "PORT_ALERTS": ("port_alerts", boolean, "true"),
     "MAINTENANCE_INTERVAL_SECONDS": ("maintenance_interval", int, "21600"),
-    "CVE_INTERVAL_SECONDS": ("cve_interval", int, "86400"),
     "PORT_INTERVAL_SECONDS": ("port_interval", int, "60"),
     "EXPECTED_PORTS": ("expected_ports", str, "tcp:22"),
     "STATE_DIRECTORY": ("state_directory", str, ""),
@@ -50,10 +44,10 @@ def tailscale_reminder(expiry, today=None):
     if days > 30:
         return None
     if days < 0:
-        return 'passed', '⚠️ Configured Tailscale key expiry (%s) has passed. Verify access and renew/re-authenticate the device.' % expiry
+        return 'passed', '⚠️ Tailscale expiry date has passed\nExpiry: %s\nNext step: Verify access and renew/re-authenticate the device.' % expiry
     stage = next(str(limit) for limit in (0, 1, 3, 7, 14, 30) if days <= limit)
     when = 'today' if days == 0 else 'in %s day(s)' % days
-    return stage, '🔑 Tailscale key expires %s (%s). Renew/re-authenticate before expiry to preserve remote access.' % (when, expiry)
+    return stage, '🔑 Tailscale key expires %s\nExpiry: %s\nNext step: Renew/re-authenticate before expiry to preserve remote access.' % (when, expiry)
 
 
 def command(args, timeout=60):
@@ -67,24 +61,6 @@ def command(args, timeout=60):
     if result.returncode:
         raise RuntimeError(args[0] + " failed (exit %s)" % result.returncode)
     return result.stdout
-
-
-def download(url, target, limit=25 * 1024 * 1024):
-    request = urllib.request.Request(url, headers={"User-Agent": "Reimu-VPS-Monitor"})
-    try:
-        with urllib.request.urlopen(request, timeout=45) as response:
-            with target.open("wb") as output:
-                total = 0
-                while True:
-                    chunk = response.read(65536)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if total > limit:
-                        raise RuntimeError("Downloaded data exceeded its size limit")
-                    output.write(chunk)
-    except (OSError, ValueError):
-        raise RuntimeError("Could not download maintenance data over HTTPS") from None
 
 
 def atomic_json(path, value):
@@ -161,8 +137,11 @@ def listening_ports():
 
 
 def port_description(item):
-    return "%s/%s on %s (%s); process: %s" % (
-        item["port"], item["protocol"].upper(), item["address"], item["scope"], item["process"])
+    scope = 'local only' if item['scope'] == 'localhost' else 'network interface'
+    text = '%s/%s · %s · %s' % (item['port'], item['protocol'].upper(), item['address'], scope)
+    if item['process'] != 'not visible to service user':
+        text += ' · ' + item['process']
+    return text
 
 
 def port_changes(previous, current, expected):
@@ -174,192 +153,10 @@ def port_changes(previous, current, expected):
                         and old["scope"] == "localhost" for old in previous.values())
         if "%s:%s" % (item["protocol"], item["port"]) in expected and not (was_local and item["scope"] != "localhost"):
             continue
-        messages.append("⚠️ New listener: " + port_description(item))
+        messages.append("➕ New listener · " + port_description(item))
     for key in sorted(set(previous) - set(current)):
-        messages.append("ℹ️ Listener stopped: " + port_description(previous[key]))
+        messages.append("➖ Listener stopped · " + port_description(previous[key]))
     return messages
-
-
-def local_name(element):
-    return element.tag.rsplit("}", 1)[-1]
-
-
-def child_text(element, name, default=""):
-    for child in element:
-        if local_name(child) == name:
-            return child.text or default
-    return default
-
-
-def contributing_criteria(element):
-    """A true leaf inside a false kernel-flavour branch is not evidence."""
-    name = local_name(element)
-    if name in ("definition", "criteria", "criterion") and element.get("result") != "true":
-        return
-    if name == "criterion":
-        yield element
-        return
-    for child in element:
-        if local_name(child) in ("criteria", "criterion"):
-            yield from contributing_criteria(child)
-
-
-def oval_findings(results_path):
-    """Read evaluated OVAL results, not guessed upstream version comparisons."""
-    root = ET.parse(results_path).getroot()
-    definitions, tests, states, items = {}, {}, {}, {}
-    evaluated = []
-    result_tests = {}
-    incomplete = 0
-    for element in root.iter():
-        name = local_name(element)
-        if name == "definition" and element.get("id"):
-            definitions[element.get("id")] = element
-        elif name == "definition" and element.get("definition_id"):
-            evaluated.append(element)
-        elif name in ("dpkginfo_test", "uname_test", "variable_test"):
-            tests[element.get("id")] = element
-        elif name in ("dpkginfo_state", "uname_state", "variable_state"):
-            states[element.get("id")] = element
-        elif name in ("dpkginfo_item", "uname_item", "variable_item"):
-            items[element.get("id")] = element
-        elif name == "test" and element.get("test_id"):
-            result_tests[element.get("test_id")] = element
-    findings = []
-    if not evaluated or not any(definition.get("class") == "vulnerability" for definition in definitions.values()):
-        raise RuntimeError("OVAL results lack evaluated vulnerability definitions; assessment unavailable")
-    for evaluated_definition in evaluated:
-        definition = definitions.get(evaluated_definition.get("definition_id"))
-        if definition is None or definition.get("class") != "vulnerability":
-            continue
-        verdict = evaluated_definition.get("result")
-        if verdict in ("error", "unknown", "not evaluated"):
-            incomplete += 1
-        if verdict != "true":
-            continue
-        cves = sorted({ref.get("ref_id") for ref in definition.iter()
-                       if local_name(ref) == "reference" and ref.get("source") == "CVE"})
-        severity = next((node.text for node in definition.iter() if local_name(node) == "severity"), "Unknown")
-        packages = []
-        comments = {node.get("test_ref"): node.get("comment", "") for node in definition.iter() if node.get("test_ref")}
-        for criterion in contributing_criteria(evaluated_definition):
-            test_id = criterion.get("test_ref")
-            test, tested = tests.get(test_id), result_tests.get(test_id)
-            if test is None or tested is None:
-                continue
-            fixed = []
-            for state_ref in test:
-                state = states.get(state_ref.get("state_ref"))
-                if state is not None:
-                    fixed.extend(node.text for node in state if local_name(node) in ("evr", "value") and node.get("operation") == "less than")
-            for tested_item in tested:
-                existence_only = not any(local_name(node) == "state" for node in test)
-                if local_name(tested_item) != "tested_item" or not (tested_item.get("result") == "true" or (existence_only and tested_item.get("result") == "not evaluated")):
-                    continue
-                item = items.get(tested_item.get("item_id"))
-                if item is None:
-                    continue
-                variable = local_name(item) == "variable_item"
-                if variable and "kernel" not in test.get("comment", "").lower():
-                    continue
-                kernel = local_name(item) == "uname_item" or variable
-                comment = comments.get(test_id, "") or test.get("comment", "Ubuntu OVAL matched")
-                packages.append({"name": "Linux kernel" if kernel else child_text(item, "name"),
-                                 "installed": child_text(item, "value") if variable else child_text(item, "os_release") if kernel else child_text(item, "evr"),
-                                 "fixed": sorted(set(fixed)),
-                                 "assessment": comment, "kind": "kernel" if kernel else "apt"})
-        kernels = [package for package in packages if package["kind"] == "kernel"]
-        if kernels:
-            combined = kernels[0].copy()
-            combined["fixed"] = sorted({version for package in kernels for version in package["fixed"]})
-            packages = [package for package in packages if package["kind"] != "kernel"] + [combined]
-        if not packages:
-            incomplete += 1
-        for cve in cves:
-            findings.append({"cve": cve, "severity": severity or "Unknown", "packages": packages})
-    return sorted(findings, key=lambda finding: finding["cve"]), incomplete
-
-
-def verify_feed_age(path):
-    stamp = None
-    for _, element in ET.iterparse(path, events=("end",)):
-        if local_name(element) == "generator":
-            stamp = child_text(element, "timestamp")
-            break
-    try:
-        generated = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-        if generated.tzinfo is None:
-            generated = generated.replace(tzinfo=timezone.utc)
-        age = (datetime.now(timezone.utc) - generated).total_seconds()
-    except (AttributeError, ValueError):
-        raise RuntimeError("Ubuntu CVE feed has no usable generation timestamp") from None
-    if age > 7 * 86400 or age < -86400:
-        raise RuntimeError("Ubuntu CVE feed is stale or server time is incorrect; assessment unavailable")
-
-
-def annotate_fixes(findings):
-    try:
-        import apt
-        import apt_pkg
-        cache = apt.Cache()
-    except ImportError:
-        cache = None
-    for finding in findings:
-        for package in finding["packages"]:
-            if not package["fixed"]:
-                package["fix_status"] = "No fixed version specified in the assessment"
-            elif package.get("kind") == "kernel":
-                package["fix_status"] = "Kernel fix listed; review Ubuntu advisory and kernel package updates"
-            elif cache is None:
-                package["fix_status"] = "APT availability could not be checked"
-            elif package["name"] not in cache or cache[package["name"]].candidate is None:
-                package["fix_status"] = "No candidate in enabled APT repositories"
-            else:
-                candidate = cache[package["name"]].candidate.version
-                available = any(apt_pkg.version_compare(candidate, version) >= 0 for version in package["fixed"])
-                package["fix_status"] = ("Available candidate: " + candidate) if available else "Fix not offered by enabled APT repositories"
-    return findings
-
-
-def cve_scan(directory, keep_results=False):
-    if not shutil.which("oscap"):
-        raise RuntimeError("CVE scan unavailable: install openscap-scanner")
-    release = {}
-    for line in Path("/etc/os-release").read_text().splitlines():
-        key, separator, value = line.partition("=")
-        if separator:
-            release[key] = value.strip('"')
-    codename = release.get("VERSION_CODENAME", "")
-    if release.get("ID") != "ubuntu" or not re.fullmatch("[a-z]+", codename):
-        raise RuntimeError("CVE checks currently support standard Ubuntu releases only")
-    with tempfile.TemporaryDirectory(dir=directory, prefix="scan-") as scratch:
-        scratch = Path(scratch)
-        archive, source, results = scratch / "feed.bz2", scratch / "feed.xml", scratch / "results.xml"
-        download("https://security-metadata.canonical.com/oval/com.ubuntu.%s.cve.oval.xml.bz2" % codename, archive)
-        with bz2.open(archive, "rb") as compressed, source.open("wb") as output:
-            size = 0
-            while True:
-                chunk = compressed.read(65536)
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > 300 * 1024 * 1024:
-                    raise RuntimeError("Expanded OVAL feed exceeded its size limit")
-                output.write(chunk)
-        verify_feed_age(source)
-        try:
-            with (scratch / "oscap.log").open("w") as log:
-                result = subprocess.run(["oscap", "oval", "eval", "--results", str(results), str(source)],
-                                        stdout=log, stderr=log, timeout=900)
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("CVE scan timed out after 15 minutes") from None
-        if result.returncode != 0 or not results.exists():
-            shutil.copyfile(scratch / "oscap.log", Path(directory) / "last-oscap-error.log")
-            raise RuntimeError("OpenSCAP scan failed (exit %s); see last-oscap-error.log in the state directory" % result.returncode)
-        if keep_results:
-            shutil.copyfile(results, Path(directory) / "last-oval-results.xml")
-        findings, incomplete = oval_findings(results)
-        return annotate_fixes(findings), incomplete
 
 
 def reimu_update():
@@ -387,21 +184,6 @@ def reimu_update():
     if comparison.get("status") in ("behind", "diverged"):
         raise RuntimeError("Installed Reimu history differs from main; review manually")
     return ""
-
-
-def cve_snapshot(findings):
-    """Compare security facts, ignoring ordering, timestamps and prose edits."""
-    snapshot = {}
-    for finding in findings:
-        packages = [{
-            'name': package['name'], 'installed': package['installed'],
-            'kind': package.get('kind', 'apt'), 'fixed': sorted(set(package['fixed'])),
-            'fix_status': package.get('fix_status', ''),
-            'potential': 'might' in package.get('assessment', '').lower(),
-        } for package in finding['packages']]
-        snapshot[finding['cve']] = {'severity': finding['severity'],
-                                   'packages': sorted(packages, key=lambda item: json.dumps(item, sort_keys=True))}
-    return snapshot
 
 
 class Maintenance:
@@ -436,7 +218,8 @@ class Maintenance:
     def updates(self):
         packages = package_updates()
         count = sum(package["security"] for package in packages)
-        messages = ["🔔 Package updates: %s (%s security)" % (len(packages), count)]
+        messages = ['📦 Package updates available' if packages else '✅ Package updates cleared',
+                    'Available: %s packages · %s security' % (len(packages), count), '']
         messages += ["%s: %s → %s%s" % (p["package"], p["installed"], p["candidate"], " [security]" if p["security"] else "") for p in packages[:12]]
         self.notify("packages", packages, messages, baseline=not packages)
         age = apt_cache_age()
@@ -450,8 +233,9 @@ class Maintenance:
     def tailscale_expiry(self):
         expiry = self.config['tailscale_key_expiry']
         self.notify('tailscale_expiry_configuration', expiry,
-                    ['🔑 Tailscale key-expiry reminder configured: ' + expiry,
-                     'Uses your supplied date, not a live Tailscale check. Reminders at 30, 14, 7, 3 and 1 days, on expiry day, and after expiry.']
+                    ['🔑 Tailscale reminder saved', 'Expiry: ' + expiry,
+                     'Reminders: 30, 14, 7, 3 and 1 days before; on and after expiry.',
+                     'Manual date; renewal is not automatic.']
                     if expiry else ['Tailscale key-expiry reminders disabled.'], baseline=not expiry)
         if not expiry:
             self.notify('tailscale_expiry_stage', '', [])
@@ -460,7 +244,7 @@ class Maintenance:
         if reminder is not None:
             stage, text = reminder
             self.notify('tailscale_expiry_stage', expiry + ':' + stage,
-                        [text, 'Exact expiry time is not known. Update TAILSCALE_KEY_EXPIRY in /etc/reimu-vps.env after renewal, then restart Reimu.'])
+                        [text, 'Update the saved expiry date after renewal.'])
 
     def automatic_updates(self, directory=Path('/var/lib/reimu-security-updates')):
         configuration = directory / 'configuration.json'
@@ -468,8 +252,8 @@ class Maintenance:
             return
         configured = json.loads(configuration.read_text())
         self.notify('automatic_update_configuration', {key: value for key, value in configured.items() if key != 'enabled_at'},
-                    ['🛡️ Automatic Ubuntu security updates enabled.',
-                     'Schedule: ' + configured['schedule'], 'Reboots remain manual.'])
+                    ['🛡️ Security updates enabled',
+                     'Schedule: ' + configured['schedule'], 'Reboots: Manual'])
         path = directory / 'status.json'
         if not path.exists():
             if time.time() - configured.get('enabled_at', time.time()) > 30 * 3600:
@@ -512,69 +296,16 @@ class Maintenance:
         with self.lock:
             previous = self.state.get("ports")
         if previous is None:
-            messages = ["ℹ️ Port baseline recorded (%s listeners). Future changes will be reported." % len(current)]
-            messages += [port_description(item) for item in list(current.values())[:12]]
+            messages = ['🔌 Network ports recorded', 'Listeners: %s' % len(current), '']
+            messages += ['• ' + port_description(item) for item in list(current.values())[:12]]
         else:
             messages = port_changes(previous, current, self.config["expected_ports"])
         if messages:
-            messages.append("Listening addresses only; firewall/NAT reachability is not tested.")
+            if previous is not None:
+                messages.insert(0, '🔌 Network ports changed')
+            messages += ['', 'Firewall reachability is not tested.']
         self.notify("ports", current, messages)
 
-    def cves(self):
-        findings, incomplete = cve_scan(self.directory)
-        snapshot = cve_snapshot(findings)
-        notified = self.directory / 'cve-notified.json'
-        full_report = self.directory / 'cve-findings.json'
-        previous = json.loads(notified.read_text()) if notified.exists() else None
-        # Migrate an already-delivered legacy report without resending its top CVEs.
-        if previous is None and full_report.exists():
-            legacy = json.loads(full_report.read_text())
-            fingerprint = hashlib.sha256(json.dumps([legacy['findings'], legacy['incomplete']], sort_keys=True).encode()).hexdigest()
-            with self.lock:
-                delivered = self.state.get('cves') == fingerprint
-            if delivered:
-                previous = {'findings': cve_snapshot(legacy['findings']), 'incomplete': legacy['incomplete']}
-                atomic_json(notified, previous)
-        old = previous['findings'] if previous is not None else {}
-        added = set(snapshot) - set(old)
-        changed = {cve for cve in set(snapshot) & set(old) if snapshot[cve] != old[cve]}
-        removed = (set(old) - set(snapshot)) if not incomplete else set()
-        selected = findings if previous is None else [finding for finding in findings if finding['cve'] in added | changed]
-        lines = []
-        if previous is None:
-            lines = ['🔴 Initial Ubuntu CVE assessment: %s finding(s)' % len(findings)] if findings else ['✅ No matching CVEs found in the current Ubuntu assessment']
-        elif added or changed or removed:
-            lines = ['🔔 CVE changes: %s new, %s changed, %s no longer matching.' % (len(added), len(changed), len(removed)),
-                     'Current assessment: %s matching CVEs. Unchanged findings are omitted.' % len(snapshot)]
-            if removed:
-                lines.append('No longer matching does not prove a fix was installed; package changes or revised vulnerability data can also explain it.')
-        elif incomplete != previous.get('incomplete'):
-            lines = ['⚠️ CVE scan is incomplete' if incomplete else 'ℹ️ CVE scan is complete again; no finding changes.']
-        if incomplete:
-            if lines:
-                lines[0] = '⚠️ Incomplete CVE scan: ' + lines[0].lstrip('🔴🔔✅⚠️ ')
-                lines.append('%s definitions could not be evaluated. Missing findings are not marked resolved.' % incomplete)
-        if lines:
-            lines.append("Scope: Ubuntu packages/running kernel; Canonical severity. Not an all-software safety guarantee.")
-        ordered = sorted(selected, key=lambda item: ({"Critical": 0, "High": 1, "Medium": 2, "Low": 3}.get(item["severity"], 4), item["cve"]))
-        for finding in ordered[:8]:
-            lines.append("\n%s — %s" % (finding["cve"], finding["severity"]))
-            for package in finding["packages"][:3]:
-                fix = ", ".join(package["fixed"]) or "not specified by this assessment"
-                lines.append("%s %s; fixed version: %s" % (package["name"], package["installed"], fix))
-                lines.append(package.get("fix_status", "APT availability not checked"))
-                if "might" in package["assessment"]:
-                    lines.append("Ubuntu marks this as potentially affected; review advisory.")
-            lines.append("https://ubuntu.com/security/" + finding["cve"])
-        if len(selected) > 8:
-            lines.append('\nShowing 8 of %s relevant findings; full assessment saved on VPS.' % len(selected))
-        atomic_json(full_report, {'checked_at': time.time(), 'findings': findings, 'incomplete': incomplete})
-        # Preserve unobserved prior findings across an incomplete scan.
-        baseline = {**old, **snapshot} if incomplete else snapshot
-        next_report = {'findings': baseline, 'incomplete': incomplete}
-        fingerprint = hashlib.sha256(json.dumps(next_report, sort_keys=True).encode()).hexdigest()
-        self.notify('cves', fingerprint, lines)
-        atomic_json(notified, next_report)
 
     def version(self):
         commit = reimu_update()
@@ -603,8 +334,6 @@ class Maintenance:
             tasks["updates"] = (self.config["maintenance_interval"], self.updates)
         if self.config["reimu_update_alerts"]:
             tasks["version"] = (self.config["maintenance_interval"], self.version)
-        if self.config["cve_alerts"]:
-            tasks["CVEs"] = (self.config["cve_interval"], self.cves)
         due, pending = {}, {}
         with ThreadPoolExecutor(max_workers=3, thread_name_prefix="reimu-check") as pool:
             while not self.stop.is_set():

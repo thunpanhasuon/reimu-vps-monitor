@@ -1,12 +1,11 @@
 import json
-import hashlib
 import os
 from pathlib import Path
 import subprocess
 import tempfile
 import time
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date
 from unittest.mock import patch
 
 import security_checks as security
@@ -14,70 +13,7 @@ import vps_monitor as monitor
 
 
 class SecurityTests(unittest.TestCase):
-    @staticmethod
-    def finding(cve, severity='Critical'):
-        return {'cve': cve, 'severity': severity, 'packages': [
-            {'name': 'example', 'installed': '1', 'fixed': [], 'assessment': 'affected', 'kind': 'apt'}]}
 
-    def test_cve_change_alert_omits_unchanged_critical_findings(self):
-        with tempfile.TemporaryDirectory() as directory:
-            sent = []
-            checker = security.Maintenance({'state_directory': directory}, lambda config, text: sent.append(text))
-            old = self.finding('CVE-2099-11111')
-            new = self.finding('CVE-2099-22222', 'Low')
-            with patch.object(security, 'cve_scan', return_value=([old], 0)):
-                checker.cves()
-            sent.clear()
-            with patch.object(security, 'cve_scan', return_value=([old, new], 0)):
-                checker.cves()
-                checker.cves()
-            self.assertEqual(len(sent), 1)
-            self.assertIn('CVE-2099-22222', sent[0])
-            self.assertNotIn('CVE-2099-11111', sent[0])
-
-    def test_legacy_cve_report_migrates_without_repeat(self):
-        with tempfile.TemporaryDirectory() as directory:
-            sent = []
-            findings = [self.finding('CVE-2099-11111')]
-            fingerprint = hashlib.sha256(json.dumps([findings, 0], sort_keys=True).encode()).hexdigest()
-            security.atomic_json(Path(directory) / 'state.json', {'cves': fingerprint})
-            security.atomic_json(Path(directory) / 'cve-findings.json', {'findings': findings, 'incomplete': 0})
-            checker = security.Maintenance({'state_directory': directory}, lambda config, text: sent.append(text))
-            with patch.object(security, 'cve_scan', return_value=(findings, 0)):
-                checker.cves()
-            self.assertEqual(sent, [])
-            self.assertTrue((Path(directory) / 'cve-notified.json').exists())
-
-    def test_incomplete_scan_does_not_report_missing_cve_as_resolved(self):
-        with tempfile.TemporaryDirectory() as directory:
-            sent = []
-            checker = security.Maintenance({'state_directory': directory}, lambda config, text: sent.append(text))
-            old = self.finding('CVE-2099-11111')
-            with patch.object(security, 'cve_scan', return_value=([old], 0)):
-                checker.cves()
-            sent.clear()
-            with patch.object(security, 'cve_scan', return_value=([], 1)):
-                checker.cves()
-            self.assertNotIn('1 no longer matching', sent[0])
-            baseline = json.loads((Path(directory) / 'cve-notified.json').read_text())
-            self.assertIn('CVE-2099-11111', baseline['findings'])
-
-    def test_failed_cve_notification_keeps_previous_baseline_for_retry(self):
-        with tempfile.TemporaryDirectory() as directory:
-            sent = []
-            checker = security.Maintenance({'state_directory': directory}, lambda config, text: sent.append(text))
-            old = self.finding('CVE-2099-11111')
-            new = self.finding('CVE-2099-22222')
-            with patch.object(security, 'cve_scan', return_value=([old], 0)):
-                checker.cves()
-            previous = (Path(directory) / 'cve-notified.json').read_text()
-            def failed(config, text):
-                raise RuntimeError('offline')
-            checker.send = failed
-            with patch.object(security, 'cve_scan', return_value=([old, new], 0)):
-                with self.assertRaises(RuntimeError):
-                    checker.cves()
-            self.assertEqual((Path(directory) / 'cve-notified.json').read_text(), previous)
 
     def test_tailscale_reminder_checkpoints_and_invalid_date(self):
         self.assertIsNone(security.tailscale_reminder('2027-04-26', date(2027, 3, 26)))
@@ -117,67 +53,6 @@ class SecurityTests(unittest.TestCase):
             checker.automatic_updates(root)
             self.assertEqual(sent, [])
 
-    def test_true_version_check_in_wrong_kernel_branch_is_excluded(self):
-        xml = '''<root>
-<definition id="d1" class="vulnerability"><metadata><reference source="CVE" ref_id="CVE-2099-99999"/></metadata></definition>
-<uname_test id="running"/>
-<variable_test id="wrong-version" comment="kernel version comparison"><state state_ref="fix"/></variable_test>
-<variable_state id="fix"><value operation="less than">0:7.0.0-31</value></variable_state>
-<uname_item id="kernel"><os_release>6.8.0-147-generic</os_release></uname_item>
-<variable_item id="version"><value>0:6.8.0-147</value></variable_item>
-<definition definition_id="d1" result="true"><criteria result="true" operator="OR">
-<criterion test_ref="running" result="true"/>
-<criteria result="false" operator="AND"><criterion test_ref="wrong-flavour" result="false"/><criterion test_ref="wrong-version" result="true"/></criteria>
-</criteria></definition>
-<test test_id="running"><tested_item item_id="kernel" result="true"/></test>
-<test test_id="wrong-version"><tested_item item_id="version" result="true"/></test>
-</root>'''
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'results.xml'
-            path.write_text(xml)
-            findings, incomplete = security.oval_findings(path)
-        self.assertEqual(incomplete, 0)
-        self.assertEqual(findings[0]['packages'][0]['installed'], '6.8.0-147-generic')
-        self.assertEqual(findings[0]['packages'][0]['fixed'], [])
-
-    def test_running_kernel_evidence_and_fixed_version(self):
-        xml = '''<root>
-<definition id="d1" class="vulnerability"><metadata><reference source="CVE" ref_id="CVE-2099-99999"/></metadata></definition>
-<uname_test id="t1"><state state_ref="s1"/></uname_test>
-<uname_state id="s1"><os_release operation="pattern match">kernel</os_release></uname_state>
-<variable_test id="t2" comment="kernel version comparison"><state state_ref="s2"/></variable_test>
-<variable_state id="s2"><value operation="less than">0:6.8.0-99</value></variable_state>
-<uname_item id="i1"><os_release>6.8.0-50-generic</os_release></uname_item>
-<variable_item id="i2"><value>0:6.8.0-50</value></variable_item>
-<definition definition_id="d1" result="true"><criteria result="true"><criterion test_ref="t1" result="true"/><criterion test_ref="t2" result="true"/></criteria></definition>
-<test test_id="t1"><tested_item item_id="i1" result="true"/></test>
-<test test_id="t2"><tested_item item_id="i2" result="true"/></test>
-</root>'''
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'results.xml'
-            path.write_text(xml)
-            findings, incomplete = security.oval_findings(path)
-        self.assertEqual(incomplete, 0)
-        self.assertEqual(findings[0]['packages'][0]['name'], 'Linux kernel')
-        self.assertEqual(findings[0]['packages'][0]['fixed'], ['0:6.8.0-99'])
-        self.assertEqual(len(findings[0]['packages']), 1)
-
-    def test_stale_feed_is_not_reported_clean(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'feed.xml'
-            path.write_text('<root><generator><timestamp>2000-01-01T00:00:00Z</timestamp></generator></root>')
-            with self.assertRaisesRegex(RuntimeError, 'stale'):
-                security.verify_feed_age(path)
-            stamp = datetime.now(timezone.utc).isoformat()
-            path.write_text('<root><generator><timestamp>' + stamp + '</timestamp></generator></root>')
-            security.verify_feed_age(path)
-
-    def test_missing_evaluation_is_not_reported_clean(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'results.xml'
-            path.write_text('<root/>')
-            with self.assertRaisesRegex(RuntimeError, 'unavailable'):
-                security.oval_findings(path)
 
     def test_ipv4_ipv6_and_udp_listeners(self):
         parsed = security.parse_listeners('''tcp LISTEN 0 128 127.0.0.1:8080 0.0.0.0:* users:(("python3",pid=42,fd=3))
@@ -223,13 +98,6 @@ udp UNCONN 0 0 127.0.0.53%lo:53 0.0.0.0:*
         with patch.dict('sys.modules', {'apt': S(Cache=lambda: [package])}):
             self.assertTrue(security.package_updates()[0]['security'])
 
-    def test_fix_availability_uses_distribution_version_comparison(self):
-        from types import SimpleNamespace as S
-        package = S(candidate=S(version='2'))
-        findings = [{'packages': [{'name': 'example', 'fixed': ['2'], 'kind': 'apt'}]}]
-        with patch.dict('sys.modules', {'apt': S(Cache=lambda: {'example': package}), 'apt_pkg': S(version_compare=lambda a, b: int(a) - int(b))}):
-            annotated = security.annotate_fixes(findings)
-        self.assertEqual(annotated[0]['packages'][0]['fix_status'], 'Available candidate: 2')
 
     def test_self_update_uses_remote_ref_and_ancestry(self):
         from io import BytesIO
@@ -243,35 +111,19 @@ udp UNCONN 0 0 127.0.0.53%lo:53 0.0.0.0:*
             root = Path(directory)
             (root / 'etc').mkdir()
             path = root / 'etc/reimu-vps.env'
-            path.write_text('TELEGRAM_BOT_TOKEN=123:example\nTELEGRAM_CHAT_ID=123\n')
+            path.write_text('TELEGRAM_BOT_TOKEN=123:example\nTELEGRAM_CHAT_ID=123\nCVE_ALERTS=true\nCVE_INTERVAL_SECONDS=86400\n')
             def run(args, **kwargs):
                 return subprocess.CompletedProcess(args, 0, stdout='a' * 40 + '\n')
             with patch.object(monitor.os, 'geteuid', return_value=0), patch.object(monitor.os, 'chown'), patch.object(monitor.subprocess, 'run', side_effect=run), patch('builtins.print'):
                 monitor.install(path, root=root, tailscale_key_expiry='2027-04-26')
             self.assertIn('TELEGRAM_BOT_TOKEN=123:example', path.read_text())
+            self.assertNotIn('CVE_ALERTS', path.read_text())
+            self.assertNotIn('CVE_INTERVAL_SECONDS', path.read_text())
             self.assertEqual(monitor.read_env(path)['TAILSCALE_KEY_EXPIRY'], '2027-04-26')
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertTrue((root / 'opt/reimu-vps/security_checks.py').exists())
+            self.assertTrue((root / 'opt/reimu-vps/alert_format.py').exists())
 
-    def test_oval_only_reports_true_vulnerabilities(self):
-        xml = '''<root>
-<definition id="d1" class="vulnerability"><metadata><reference source="CVE" ref_id="CVE-2099-99999"/><severity>High</severity></metadata></definition>
-<definition id="d2" class="vulnerability"/>
-<dpkginfo_test id="t1"><state state_ref="s1"/></dpkginfo_test>
-<dpkginfo_state id="s1"><evr operation="less than">2</evr></dpkginfo_state>
-<dpkginfo_item id="i1"><name>example</name><evr>1</evr></dpkginfo_item>
-<definition definition_id="d1" result="true"><criteria result="true"><criterion test_ref="t1" result="true" comment="package is affected"/></criteria></definition>
-<definition definition_id="d2" result="unknown"/>
-<test test_id="t1"><tested_item item_id="i1" result="true"/></test>
-</root>'''
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'results.xml'
-            path.write_text(xml)
-            findings, incomplete = security.oval_findings(path)
-        self.assertEqual(incomplete, 1)
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0]['packages'][0]['fixed'], ['2'])
-        self.assertEqual(findings[0]['packages'][0]['installed'], '1')
 
     def test_invalid_maintenance_settings(self):
         with tempfile.TemporaryDirectory() as directory:

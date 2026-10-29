@@ -3,13 +3,23 @@
 Telegram alerts for CPU, RAM, disk usage, and network traffic on a Linux VPS.
 Python 3.8+ and systemd; no pip packages, domain, or inbound ports required.
 
+Messages use Telegram HTML formatting: clear event headings, a server label,
+aligned resource readings, readable package-version changes, and a Cambodia
+timestamp. Low network rates display in Kbps instead of rounding to 0.0 Mbps.
+Process/package names are escaped as text, and link previews are disabled.
+Send a test card after installation with:
+
+```bash
+/usr/bin/python3 /opt/reimu-vps/vps_monitor.py test --config /etc/reimu-vps.env
+```
+
 ## Install on your VPS
 
 Clone this repository, enter its directory, then run:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y python3-apt openscap-scanner iproute2
+sudo apt-get install -y python3-apt iproute2
 cp .env.example .env
 chmod 600 .env
 nano .env
@@ -50,7 +60,7 @@ unattended-upgrades may already apply updates independently of Reimu.
 ```bash
 git pull --ff-only
 sudo apt-get update
-sudo apt-get install -y python3-apt openscap-scanner iproute2
+sudo apt-get install -y python3-apt iproute2
 sudo /usr/bin/python3 vps_monitor.py install --config /etc/reimu-vps.env
 sudo systemctl status reimu-vps --no-pager
 ```
@@ -66,7 +76,6 @@ recorded so update notifications compare against the version actually running.
 | --- | --- | --- |
 | Package and security updates | Every 6 hours | Reports pending APT packages and versions, with security-origin labels |
 | Reboot required | Every minute | Reports Ubuntu's reboot-required flag and when it clears |
-| Ubuntu CVEs | Daily | Downloads Canonical CVE OVAL data and evaluates installed packages using OpenSCAP |
 | Reimu updates | Every 6 hours | Checks GitHub main against the installed Git commit |
 | Listening-port changes | Every minute | Reports new or stopped TCP/UDP listeners and binding changes |
 
@@ -82,33 +91,6 @@ on a non-loopback address is **not proof of internet reachability**; Reimu does
 not change or probe firewalls. Process names may be unavailable for processes
 owned by another user. Short-lived listeners between checks may be missed.
 
-CVE alerts show the Canonical severity, CVE ID, installed package or running
-kernel evidence, and the fixed version when supplied by the assessment.
-For APT packages, candidate availability is checked against your enabled
-repositories using Debian version comparison. Kernel findings link to the
-Ubuntu advisory for package-specific remediation. Some fixes require Ubuntu
-Pro/ESM. Potentially affected packages
-are labeled as such. This covers Ubuntu APT package assessments, not pip/npm
-dependencies, Docker images, custom builds, or every third-party PPA.
-An old vulnerable kernel package can match even when a newer kernel is
-running; assess the listed installed package and reboot status together.
-
-Alerts show at most eight CVEs per summary, with higher Canonical severities
-first. After the initial scan, alerts show only newly matching CVEs or changes
-to severity, affected installed versions, fixed versions, or fix availability.
-Unchanged CVEs stay quiet even if the overall count changes. Findings that no
-longer match are summarized without resending the old critical list; this can
-reflect revised vulnerability data as well as package changes, so it is not
-proof that a fix was installed. Incomplete scans do not mark missing findings
-as resolved. Existing delivered reports are migrated without another full alert.
-Full findings are saved privately at
-`/var/lib/reimu-vps/cve-findings.json`. Scan errors and incomplete evaluations
-are explicitly reported. Feeds more than seven days old are rejected rather
-than treated as current. Review advisories before installing fixes.
-
-Sources: [Canonical OVAL documentation](https://documentation.ubuntu.com/security/security-updates/oval/)
-and [official Ubuntu feeds](https://security-metadata.canonical.com/oval/).
-
 Configuration switches and intervals are listed in `.env.example`. They are
 optional in existing `.env` files; sensible defaults apply. Change the installed
 configuration and restart the service to override them. To run checks manually:
@@ -119,7 +101,7 @@ configuration and restart the service to override them. To run checks manually:
 
 Run as the service's user (normally your SSH user) to access its private state.
 Avoid running manual checks concurrently with the service. GitHub errors,
-missing dependencies, and unavailable Ubuntu feeds produce a check-unavailable
+missing dependencies, and unavailable update data produce a check-unavailable
 alert. Package metadata older than 48 hours or without a successful-refresh
 stamp produces a freshness warning.
 

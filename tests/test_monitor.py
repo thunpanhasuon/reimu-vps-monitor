@@ -10,6 +10,13 @@ import vps_monitor as monitor
 
 
 class MonitorTests(unittest.TestCase):
+    def test_retired_scanner_settings_do_not_break_existing_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / '.env'
+            path.write_text('TELEGRAM_BOT_TOKEN=123:example\nTELEGRAM_CHAT_ID=123\nCVE_ALERTS=true\nCVE_INTERVAL_SECONDS=86400\n')
+            config = monitor.load(path)
+            self.assertNotIn('cve_alerts', config)
+            self.assertNotIn('CVE_ALERTS', monitor.read_env(path))
     def test_pairing_recovers_from_network_failure(self):
         updates = [{'update_id': 7, 'message': {'text': 'pair-test', 'chat': {'type': 'private', 'id': 123}}}]
         with patch.object(monitor, 'api', side_effect=[monitor.TelegramConnectionError('Telegram: request timed out'), updates]) as api:
